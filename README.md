@@ -1,103 +1,284 @@
-# PSQL Interface Overview
+# PSQL Interface
 
-`src/psql_client.py` provides a `PSQLClient` class: a thread-safe PostgreSQL helper built on `psycopg2` and `ThreadedConnectionPool`.
+`src/psql_client.py` is a pooled PostgreSQL utility layer built on `psycopg2` and `ThreadedConnectionPool`.
 
-## High-Level Functionality
+It provides:
+- safe-ish dynamic SQL composition through `psycopg2.sql`
+- connection pooling + cached client reuse
+- database/schema/table/index/constraint helpers
+- higher-level CRUD helpers with validated filters, joins, and pagination
+- typed filter primitives (`JoinSpec`, `RawCondition`)
 
-- Manages pooled PostgreSQL connections for concurrent use.
-- Supports cached client reuse with `PSQLClient.get(...)` and global cleanup with `PSQLClient.closeall()`.
-- Executes SQL with transaction handling (commit on success, rollback on failure).
-- Runs database-level statements that require autocommit (for example, `CREATE DATABASE` / `DROP DATABASE`).
-- Uses `psycopg2.sql` composition for safe identifier handling when building SQL dynamically.
+## What's New In The Refactor
 
-## Core Capabilities
+- Added `JoinSpec` and `RawCondition` for structured joins and raw filter fragments.
+- Added cache locking and safer client lifecycle handling (`close()` is idempotent and evicts cached instance).
+- Unified execution internals through `_execute_on_conn(...)`.
+- Consolidated repeated filter/join builder logic into shared internal helpers.
+- Unified column lookup internals with `_fetch_table_columns(...)`.
 
-- Database helpers: check, create, and drop databases.
-- Schema helpers: check, list, create, drop, and ensure schemas.
-- Table/column helpers: check/list tables and columns, create/drop tables, add/drop columns, and alter column type/nullability/defaults.
-- Index and constraint helpers: create/drop/check indexes, add/drop/check constraints, and inspect constraint-related metadata.
-- Metadata inspection: column info, primary key columns, constraint columns, and index/constraint listings.
+## Quick Start
 
-## API Reference (High-Level)
+```python
+from src.psql_client import PSQLClient, JoinSpec, RawCondition
 
-### Classes
+client = PSQLClient.get(
+    database="mydb",
+    user="postgres",
+    password="secret",
+    host="localhost",
+    port=5432,
+)
 
-- `class PSQLClient`: Thread-safe PostgreSQL client that wraps a `ThreadedConnectionPool` and provides schema/table/query utilities.
+rows, total_pages = client.get_rows_with_filters(
+    "public.users",
+    equalities={"active": True},
+    joins=[JoinSpec("LEFT JOIN", "public.roles r", "r.id = users.role_id")],
+    raw_conditions=[RawCondition("users.created_at >= %s", ("2025-01-01",))],
+    page_limit=25,
+    page_num=0,
+    order_by="id",
+)
 
-### Class Methods
+PSQLClient.closeall()
+```
 
-- `get(cls, *, database: str = "postgres", user: str = "postgres", password: Optional[str] = None, host: Optional[str] = None, port: Optional[int] = None, minconn: int = 1, maxconn: int = 10, **conn_kwargs) -> "PSQLClient"`: Returns a cached client for matching connection parameters, creating one if needed.
-- `closeall(cls) -> None`: Closes all cached client pools and clears the cache.
+## Data Structures
 
-### Lifecycle and Pool Methods
+### `JoinSpec`
 
-- `__init__(self, *, database: str = "postgres", user: str = "postgres", password: Optional[str] = None, host: Optional[str] = None, port: Optional[int] = None, minconn: int = 1, maxconn: int = 10, **conn_kwargs)`: Stores connection settings and creates the connection pool.
-- `__repr__(self) -> str`: Returns a debug-friendly string showing user/host/database and pool sizing.
-- `close(self) -> None`: Closes this instance's connection pool.
-- `_get_conn(self)`: Retrieves a single connection from the pool.
-- `_put_conn(self, conn)`: Returns a connection to the pool.
+```python
+JoinSpec(join_type: str, table_expr: str, on_clause: str)
+```
 
-### Execution Methods
+Represents one SQL join segment used by filter APIs.
+- `join_type`: e.g. `"JOIN"`, `"LEFT JOIN"`, `"INNER JOIN"`
+- `table_expr`: table expression after `JOIN`
+- `on_clause`: SQL condition after `ON`
 
-- `_execute(self, query, params: Optional[Iterable] = None) -> list[dict] | None`: Executes SQL in a transaction and returns rows as `list[dict]` when a result set exists.
-- `execute_query(self, query, params: Optional[Iterable] = None) -> list[dict] | None`: Public wrapper for `_execute` for raw SQL reads/writes.
-- `_execute_autocommit(self, query, params: Optional[Iterable] = None) -> list[dict] | None`: Executes SQL with autocommit enabled for statements that cannot run inside a transaction.
+### `RawCondition`
 
-### Database Helpers
+```python
+RawCondition(expression: str, params: tuple[Any, ...] = ())
+```
 
-- `database_exists(self, db_name: str) -> bool`: Checks whether a database exists.
-- `create_database(self, db_name: str, exists_ok: bool = True) -> bool`: Creates a database and optionally no-ops if it already exists.
-- `drop_database(self, db_name: str, missing_ok: bool = True) -> bool`: Drops a database, optionally validating existence first.
+Represents one raw SQL predicate and its bound values.
+- `expression`: SQL fragment to insert into `WHERE`
+- `params`: positional values consumed by placeholders in `expression`
 
-### Schema Helpers
+## API Reference
 
-- `schema_exists(self, schema: str) -> bool`: Checks whether a schema exists.
-- `list_schemas(self, exclude_system: bool = True) -> list[str]`: Lists schema names, optionally excluding system schemas.
-- `create_schema(self, schema: str, exists_ok: bool = True) -> None`: Creates a schema with optional `IF NOT EXISTS` behavior.
-- `drop_schema(self, schema: str, cascade: bool = False, missing_ok: bool = True) -> None`: Drops a schema with optional cascade and missing guard.
-- `ensure_schema(self, schema: str) -> None`: Ensures a schema exists (idempotent create).
+Private methods are included because they are part of the current implementation, but their signatures are less stable than public methods.
 
-### Table and Column Helpers
+### Class: `PSQLClient`
 
-- `table_exists(self, schema: str, table: str) -> bool`: Checks whether a table exists in a schema.
-- `list_tables(self, schema: str = "public") -> list[str]`: Lists base tables in a schema.
-- `get_table_columns(self, schema: str, table: str) -> list[str]`: Lists ordered column names for a table.
-- `column_exists(self, schema: str, table: str, column: str) -> bool`: Checks whether a specific column exists.
-- `create_table(self, schema: str, table: str, columns: dict[str, str], constraints: list[str] | None = None, if_not_exists: bool = True, temporary: bool = False) -> None`: Creates a table from column definitions and optional table constraints.
-- `drop_table(self, schema: str, table: str, cascade: bool = False, missing_ok: bool = True) -> None`: Drops a table with optional cascade and missing guard.
-- `ensure_table(self, schema: str, table: str, columns: dict[str, str], constraints: list[str] | None = None) -> None`: Ensures a table exists by creating it with `IF NOT EXISTS`.
-- `drop_column(self, schema: str, table: str, column: str, *, cascade: bool = False, missing_ok: bool = True) -> None`: Drops a column with optional cascade and missing guard.
-- `alter_column_type(self, schema: str, table: str, column: str, type_sql: str, *, using: str | None = None) -> None`: Changes a column type with optional `USING` expression.
-- `alter_column_nullability(self, schema: str, table: str, column: str, *, nullable: bool) -> None`: Sets or drops `NOT NULL` on a column.
-- `alter_column_default(self, schema: str, table: str, column: str, *, default_sql: str | None = None, drop: bool = False) -> None`: Sets or drops a column default.
-- `add_column(self, schema: str, table: str, column: str, type_sql: str) -> None`: Adds a new column to a table.
+#### Class methods
 
-### Index and Constraint Helpers
+`get(cls, *, database: str = "postgres", user: str = "postgres", password: Optional[str] = None, host: Optional[str] = None, port: Optional[int] = None, minconn: int = 1, maxconn: int = 10, **conn_kwargs) -> "PSQLClient"`  
+Returns a cached client for the same connection/pool configuration. If cached instance is closed or missing, creates a fresh one.
 
-- `index_exists(self, schema: str, index_name: str) -> bool`: Checks whether an index exists.
-- `create_index(self, schema: str, table: str, index_name: str, columns: list[str], unique: bool = False, if_not_exists: bool = True) -> None`: Creates an index on one or more columns.
-- `drop_index(self, schema: str, index_name: str, missing_ok: bool = True) -> None`: Drops an index with optional missing guard.
-- `drop_constraint(self, schema: str, table: str, constraint_name: str, *, missing_ok: bool = True) -> None`: Drops a table constraint.
-- `constraint_exists(self, schema: str, table: str, constraint_name: str) -> bool`: Checks whether a constraint exists.
-- `add_constraint(self, schema: str, table: str, constraint_sql: str) -> None`: Adds a table constraint from raw SQL fragment.
-- `list_indexes(self, schema: str, table: str) -> list[dict]`: Lists indexes and definitions for a table.
-- `list_constraints(self, schema: str, table: str) -> list[dict]`: Lists constraints and types for a table.
-- `get_primary_key_columns(self, schema: str, table: str) -> list[str]`: Returns ordered primary key columns.
-- `get_constraint_columns(self, schema: str, table: str, constraint_name: str) -> list[str]`: Returns ordered columns for a named constraint.
-- `list_constraint_indexes(self, schema: str, table: str) -> list[str]`: Lists index names backing table constraints.
+`closeall(cls) -> None`  
+Closes all cached pools and clears the class-level cache.
 
-### Name and SQL-Building Helpers (Internal)
+#### Lifecycle and pool plumbing
 
-- `_split_qualified(self, qname) -> tuple[Optional[str], str]`: Parses `schema.table`, `table`, or tuple input into `(schema_or_none, table)`.
-- `_ident_qualified(self, qname) -> sql.Composed`: Builds a properly quoted optional schema-qualified identifier.
-- `_get_table_columns(self, table: str) -> list[str]`: Internal column lookup for qualified/unqualified table names.
-- `_paged_execute(self, query, params: list | None = None, page_limit: int = 50, page_num: int = 0, order_by: str | None = None, order_dir: str = "ASC", tiebreaker: str | None = None, base_qualifier: str | sql.Composable | None = None) -> list[dict]`: Applies validated ordering and `LIMIT/OFFSET` pagination to `SELECT`/`WITH` queries.
+`__init__(self, *, database: str = "postgres", user: str = "postgres", password: Optional[str] = None, host: Optional[str] = None, port: Optional[int] = None, minconn: int = 1, maxconn: int = 10, **conn_kwargs)`  
+Creates a `ThreadedConnectionPool`, stores connection metadata for debugging, and initializes close/cache state.
 
-### Data Access Methods
+`__repr__(self) -> str`  
+Returns a concise debug representation including connection target and pool min/max sizing.
 
-- `insert_row(self, table: str, data: dict) -> dict | None`: Inserts one row and returns the inserted record.
-- `get_rows_with_filters(self, table: str, equalities: dict | None = None, raw_conditions: str | list[str] | None = None, raw_params: list | None = None, joins: list[tuple[str, str, str]] | None = None, page_limit: int = 50, page_num: int = 0, order_by: str | None = None, order_dir: str = "ASC") -> tuple[list[dict], int]`: Executes filtered/paginated reads and returns `(rows, total_pages)`.
-- `delete_rows_with_filters(self, table: str, equalities: dict | None = None, raw_conditions: str | list[str] | None = None, raw_params: list | None = None, joins: list[tuple[str, str, str]] | None = None) -> int`: Deletes rows matching filters and returns affected row count.
-- `update_rows_with_equalities(self, table: str, updates: dict, equalities: dict) -> int`: Updates rows using equality predicates only; returns affected row count.
-- `update_rows_with_filters(self, table: str, updates: dict, equalities: dict | None = None, raw_conditions: str | list[str] | None = None, raw_params: list | None = None, joins: list[tuple[str, str, str]] | None = None) -> int`: Updates rows using flexible predicates/joins; returns affected row count.
-- `get_column_info(self, schema: str, table: str) -> dict[str, dict]`: Returns per-column metadata keyed by column name.
+`close(self) -> None`  
+Closes this instance's pool once, marks the instance closed, and removes it from cache if it came from `get(...)`.
+
+`_get_conn(self)`  
+Internal pool checkout. Raises if the client has already been closed.
+
+`_put_conn(self, conn)`  
+Internal pool return. Suppresses pool-return errors only when closure race conditions are expected.
+
+#### Execution internals
+
+`_freeze_conn_kwargs(conn_kwargs: dict[str, Any]) -> tuple[tuple[str, Any], ...] | None`  
+Converts extra connection kwargs to a deterministic hashable form for cache keys.
+
+`_normalize_query(conn, query) -> str`  
+Normalizes query input to SQL text (`str` or `psycopg2.sql` composable).
+
+`_rows_from_cursor(cur) -> list[dict] | None`  
+Maps cursor results into `list[dict]` keyed by column name, or `None` when no result set exists.
+
+`_execute_on_conn(self, conn, query, params: Optional[Iterable] = None, *, autocommit: bool = False) -> list[dict] | None`  
+Core executor used by all SQL paths. Handles autocommit mode, commits/rollbacks, and row materialization.
+
+`_execute(self, query, params: Optional[Iterable] = None) -> list[dict] | None`  
+Transactional executor: commit on success, rollback on failure.
+
+`execute_query(self, query, params: Optional[Iterable] = None) -> list[dict] | None`  
+Public generic SQL entrypoint that delegates to `_execute(...)`.
+
+`_execute_autocommit(self, query, params: Optional[Iterable] = None) -> list[dict] | None`  
+Autocommit executor for statements that must run outside transaction blocks.
+
+#### Database helpers
+
+`database_exists(self, db_name: str) -> bool`  
+Checks whether a database name exists in `pg_database`.
+
+`create_database(self, db_name: str, exists_ok: bool = True) -> bool`  
+Creates a database. Returns `False` when it already exists and `exists_ok=True`; otherwise returns `True`.
+
+`drop_database(self, db_name: str, missing_ok: bool = True) -> bool`  
+Drops a database (using `DROP DATABASE IF EXISTS`). Can enforce existence when `missing_ok=False`.
+
+#### Schema helpers
+
+`schema_exists(self, schema: str) -> bool`  
+Checks whether a schema exists in `pg_namespace`.
+
+`list_schemas(self, exclude_system: bool = True) -> list[str]`  
+Lists schema names, optionally excluding system/internal schemas.
+
+`create_schema(self, schema: str, exists_ok: bool = True) -> None`  
+Creates a schema with optional `IF NOT EXISTS` behavior.
+
+`drop_schema(self, schema: str, cascade: bool = False, missing_ok: bool = True) -> None`  
+Drops a schema with configurable `CASCADE` and missing-schema tolerance.
+
+`ensure_schema(self, schema: str) -> None`  
+Idempotent convenience wrapper around `create_schema(..., exists_ok=True)`.
+
+#### Table/column helpers
+
+`table_exists(self, schema: str, table: str) -> bool`  
+Checks whether a base table exists in a specific schema.
+
+`list_tables(self, schema: str = "public") -> list[str]`  
+Lists base tables in a schema ordered by name.
+
+`_fetch_table_columns(self, schema: str | None, table: str) -> list[str]`  
+Internal column discovery with optional schema scope.
+
+`get_table_columns(self, schema: str, table: str) -> list[str]`  
+Returns ordered column names for an explicit `schema.table`.
+
+`column_exists(self, schema: str, table: str, column: str) -> bool`  
+Checks whether a specific column exists in a table.
+
+`_require_existing_table_columns(self, table: str) -> list[str]`  
+Internal guard for qualified/unqualified table names; raises if table is missing.
+
+`_validate_known_columns(valid_columns: Sequence[str], columns: Iterable[str], label: str) -> None`  
+Internal validator to reject unknown columns in update/filter inputs.
+
+`create_table(self, schema: str, table: str, columns: dict[str, str], constraints: list[str] | None = None, if_not_exists: bool = True, temporary: bool = False) -> None`  
+Creates a table from column definitions + optional table constraints. Supports `TEMP` and `IF NOT EXISTS`.
+
+`drop_table(self, schema: str, table: str, cascade: bool = False, missing_ok: bool = True) -> None`  
+Drops a table with optional `CASCADE` and missing-table tolerance.
+
+`ensure_table(self, schema: str, table: str, columns: dict[str, str], constraints: list[str] | None = None) -> None`  
+Creates a table only if needed (`IF NOT EXISTS`).
+
+`drop_column(self, schema: str, table: str, column: str, *, cascade: bool = False, missing_ok: bool = True) -> None`  
+Drops a column with optional `CASCADE` and missing-column tolerance.
+
+`alter_column_type(self, schema: str, table: str, column: str, type_sql: str, *, using: str | None = None) -> None`  
+Alters column type and optionally applies a `USING` conversion expression.
+
+`alter_column_nullability(self, schema: str, table: str, column: str, *, nullable: bool) -> None`  
+Sets nullability (`DROP NOT NULL` when `nullable=True`; otherwise `SET NOT NULL`).
+
+`alter_column_default(self, schema: str, table: str, column: str, *, default_sql: str | None = None, drop: bool = False) -> None`  
+Sets or removes column default expression.
+
+`add_column(self, schema: str, table: str, column: str, type_sql: str) -> None`  
+Adds a new column with provided SQL type/expression.
+
+#### Index/constraint helpers
+
+`index_exists(self, schema: str, index_name: str) -> bool`  
+Checks whether an index exists in a schema.
+
+`create_index(self, schema: str, table: str, index_name: str, columns: list[str], unique: bool = False, if_not_exists: bool = True) -> None`  
+Creates an index on one or more columns with optional uniqueness and existence guard.
+
+`drop_index(self, schema: str, index_name: str, missing_ok: bool = True) -> None`  
+Drops an index with optional missing-index tolerance.
+
+`drop_constraint(self, schema: str, table: str, constraint_name: str, *, missing_ok: bool = True) -> None`  
+Drops a named table constraint with optional `IF EXISTS`.
+
+`constraint_exists(self, schema: str, table: str, constraint_name: str) -> bool`  
+Checks whether a named constraint exists on a table.
+
+`add_constraint(self, schema: str, table: str, constraint_sql: str) -> None`  
+Adds a constraint using raw SQL body (the fragment after `ADD`).
+
+`list_indexes(self, schema: str, table: str) -> list[dict]`  
+Returns index names and definitions from `pg_indexes`.
+
+`list_constraints(self, schema: str, table: str) -> list[dict]`  
+Returns table constraints and their types.
+
+`get_primary_key_columns(self, schema: str, table: str) -> list[str]`  
+Returns ordered primary key columns.
+
+`get_constraint_columns(self, schema: str, table: str, constraint_name: str) -> list[str]`  
+Returns ordered columns belonging to a specific constraint.
+
+`list_constraint_indexes(self, schema: str, table: str) -> list[str]`  
+Lists index objects that back constraints.
+
+#### Name and SQL composition helpers
+
+`_split_qualified(self, qname) -> tuple[Optional[str], str]`  
+Parses `schema.table`, `table`, or tuple/list forms into `(schema_or_none, table)`.
+
+`_ident_qualified(self, qname) -> sql.Composed`  
+Builds a correctly quoted identifier for optional schema-qualified names.
+
+`_normalize_join_spec(self, join_entry) -> JoinSpec`  
+Normalizes join definitions from `JoinSpec`, tuple/list, or SQL string (`... JOIN ... ON ...`) into one `JoinSpec`.
+
+`_normalize_joins(self, joins) -> list[JoinSpec]`  
+Normalizes join collection input for downstream builders.
+
+`_build_select_from_clause(self, table: str, joins) -> sql.Composable`  
+Builds `FROM` + explicit `JOIN` clauses for SELECT-like queries.
+
+`_build_relation_clause(self, joins, keyword: str) -> tuple[sql.Composable, list[sql.Composable]]`  
+Builds relation clause (`FROM` or `USING`) and returns associated join `ON` predicates separately.
+
+`_normalize_raw_conditions(raw_conditions, raw_params: list | tuple | None = None) -> tuple[list[sql.Composable], list]`  
+Normalizes raw conditions from `str`, `RawCondition`, or composables into SQL fragments + param list.
+
+`_build_where_parts(self, *, equalities: dict | None = None, raw_conditions=None, raw_params: list | tuple | None = None, extra_conditions: list[sql.Composable] | None = None) -> tuple[list[sql.Composable], list]`  
+Builds combined WHERE predicates and positional params from equality filters, raw fragments, and join predicates.
+
+`_get_table_columns(self, table: str) -> list[str]`  
+Column discovery wrapper that accepts qualified or unqualified table references.
+
+#### Data access methods
+
+`insert_row(self, table: str, data: dict) -> dict | None`  
+Inserts one record and returns inserted row (`RETURNING *`).
+
+`_paged_execute(self, query, params: list | None = None, page_limit: int = 50, page_num: int = 0, order_by: str | None = None, order_dir: str = "ASC", tiebreaker: str | None = None, base_qualifier: str | sql.Composable | None = None) -> list[dict]`  
+Executes a `SELECT`/`WITH` query with validated `ORDER BY`, deterministic optional tiebreaker, and `LIMIT/OFFSET`.
+
+`get_rows_with_filters(self, table: str, equalities: dict | None = None, raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None, raw_params: list | None = None, joins: list[JoinSpec | tuple[str, str, str] | str] | None = None, page_limit: int = 50, page_num: int = 0, order_by: str | None = None, order_dir: str = "ASC") -> tuple[list[dict], int]`  
+Performs filtered SELECT with optional joins + raw predicates. Returns `(rows, total_pages)` using a separate count query.
+
+`delete_rows_with_filters(self, table: str, equalities: dict | None = None, raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None, raw_params: list | None = None, joins: list[JoinSpec | tuple[str, str, str] | str] | None = None) -> int`  
+Deletes rows with equality filters, raw conditions, and/or join predicates. Refuses to run if no effective WHERE predicates are built.
+
+`update_rows_with_equalities(self, table: str, updates: dict, equalities: dict) -> int`  
+Updates rows with strict equality predicates only. Returns number of affected rows.
+
+`update_rows_with_filters(self, table: str, updates: dict, equalities: dict | None = None, raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None, raw_params: list | None = None, joins: list[JoinSpec | tuple[str, str, str] | str] | None = None) -> int`  
+Flexible update path supporting equality filters, raw predicates, and join-based predicates. Returns affected row count.
+
+`get_column_info(self, schema: str, table: str) -> dict[str, dict]`  
+Returns detailed column metadata keyed by `column_name` from `information_schema.columns`.
+

@@ -1,10 +1,32 @@
 import logging
+import re
+from dataclasses import dataclass
 from math import ceil
-from typing import Optional, Iterable
+from threading import RLock
+from typing import Any, Iterable, Optional, Sequence
 from psycopg2 import sql
 from psycopg2.pool import ThreadedConnectionPool
 
 logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class JoinSpec:
+	"""
+	Structured join definition used by filter APIs.
+	"""
+	join_type: str
+	table_expr: str
+	on_clause: str
+
+
+@dataclass(frozen=True)
+class RawCondition:
+	"""
+	Structured WHERE fragment with its own bound parameters.
+	"""
+	expression: str
+	params: tuple[Any, ...] = ()
+
 
 class PSQLClient:
 	"""
@@ -20,6 +42,28 @@ class PSQLClient:
 	"""
 
 	_cache: dict[tuple, "PSQLClient"] = {}
+	_cache_lock = RLock()
+	_JOIN_RE = re.compile(
+		r"^\s*(?P<join_type>(?:INNER|LEFT(?:\s+OUTER)?|RIGHT(?:\s+OUTER)?|FULL(?:\s+OUTER)?|CROSS|NATURAL)?\s*JOIN)\s+(?P<table_expr>.+?)\s+ON\s+(?P<on_clause>.+)\s*$",
+		flags=re.IGNORECASE
+	)
+
+	@staticmethod
+	def _freeze_conn_kwargs(conn_kwargs: dict[str, Any]) -> tuple[tuple[str, Any], ...] | None:
+		"""
+		Build a deterministic, hashable representation of extra connect kwargs.
+		"""
+		if not conn_kwargs:
+			return None
+		frozen: list[tuple[str, Any]] = []
+		for key, value in sorted(conn_kwargs.items()):
+			try:
+				hash(value)
+				frozen.append((key, value))
+			except TypeError:
+				# Fall back to repr for non-hashable kwargs (e.g., dict/list options).
+				frozen.append((key, repr(value)))
+		return tuple(frozen)
 
 	@classmethod
 	def get(
@@ -40,25 +84,30 @@ class PSQLClient:
 		"""
 		key = (
 			host, port, database, user, password,
-			tuple(sorted(conn_kwargs.items())) if conn_kwargs else None,
+			cls._freeze_conn_kwargs(conn_kwargs),
 			minconn, maxconn
 		)
-		if key not in cls._cache:
-			cls._cache[key] = cls(
-				database=database, user=user, password=password,
-				host=host, port=port, minconn=minconn, maxconn=maxconn, **conn_kwargs
-			)
-			logger.debug("Created new cached PSQLClient for key: %s", key)
-		else:
-			logger.debug("Reusing cached PSQLClient for key: %s", key)
-		return cls._cache[key]
+		with cls._cache_lock:
+			client = cls._cache.get(key)
+			if client is None or client._closed:
+				client = cls(
+					database=database, user=user, password=password,
+					host=host, port=port, minconn=minconn, maxconn=maxconn, **conn_kwargs
+				)
+				client._cache_key = key
+				cls._cache[key] = client
+				logger.debug("Created new cached PSQLClient for key: %s", key)
+			else:
+				logger.debug("Reusing cached PSQLClient for key: %s", key)
+			return client
 
 	@classmethod
 	def closeall(cls) -> None:
 		"""Close all cached connection pools and clear the cache."""
-		items = list(cls._cache.items())
-		cls._cache.clear()
-		for _, client in items:
+		with cls._cache_lock:
+			clients = list(cls._cache.values())
+			cls._cache.clear()
+		for client in clients:
 			try:
 				client.close()
 			except Exception:
@@ -81,6 +130,9 @@ class PSQLClient:
 		self.user = user
 		self.host = host
 		self.port = port
+		self._closed = False
+		self._state_lock = RLock()
+		self._cache_key: tuple | None = None
 		self._conn_kwargs = dict(conn_kwargs)
 		if password is not None:
 			self._conn_kwargs["password"] = password
@@ -107,18 +159,82 @@ class PSQLClient:
 	# ---------- Pool plumbing ----------
 	def close(self) -> None:
 		"""Close this client's pool."""
+		with self._state_lock:
+			if self._closed:
+				return
+			self._closed = True
 		try:
 			self.pool.closeall()
 		except Exception:
 			logger.exception("Error closing connection pool")
+		finally:
+			cache_key = self._cache_key
+			if cache_key is not None:
+				with self.__class__._cache_lock:
+					cached = self.__class__._cache.get(cache_key)
+					if cached is self:
+						self.__class__._cache.pop(cache_key, None)
 
 	def _get_conn(self):
+		with self._state_lock:
+			if self._closed:
+				raise RuntimeError("PSQLClient is closed.")
 		return self.pool.getconn()
 
 	def _put_conn(self, conn):
-		self.pool.putconn(conn)
+		try:
+			self.pool.putconn(conn)
+		except Exception:
+			# If the pool is already closed while returning a connection, suppress.
+			with self._state_lock:
+				if not self._closed:
+					raise
 
 	# ---------- Execution helpers ----------
+	@staticmethod
+	def _normalize_query(conn, query) -> str:
+		if isinstance(query, str):
+			return query
+		return query.as_string(conn)
+
+	@staticmethod
+	def _rows_from_cursor(cur) -> list[dict] | None:
+		if cur.description is None:
+			return None
+		colnames = [d[0] for d in cur.description]
+		rows = cur.fetchall()
+		return [dict(zip(colnames, r)) for r in rows]
+
+	def _execute_on_conn(
+		self,
+		conn,
+		query,
+		params: Optional[Iterable] = None,
+		*,
+		autocommit: bool = False,
+	) -> list[dict] | None:
+		"""
+		Core execution helper that can run using an already-acquired connection.
+		"""
+		prev_autocommit = getattr(conn, "autocommit", False)
+		try:
+			if autocommit:
+				conn.autocommit = True
+			query_text = self._normalize_query(conn, query)
+			with conn.cursor() as cur:
+				cur.execute(query_text, list(params or []))
+				rows = self._rows_from_cursor(cur)
+			if not autocommit:
+				conn.commit()
+			return rows
+		except Exception:
+			if not autocommit:
+				conn.rollback()
+			raise
+		finally:
+			if autocommit:
+				conn.autocommit = prev_autocommit
+
 	def _execute(self, query, params: Optional[Iterable] = None) -> list[dict] | None:
 		"""
 		Executes SQL (string or psycopg2.sql Composable).
@@ -127,23 +243,7 @@ class PSQLClient:
 		"""
 		conn = self._get_conn()
 		try:
-			if not isinstance(query, str):
-				query = query.as_string(conn)
-			with conn.cursor() as cur:
-				cur.execute(query, list(params or []))
-				has_result = cur.description is not None
-				if has_result:
-					colnames = [d[0] for d in cur.description]
-					rows = cur.fetchall()
-					# If it's DML with RETURNING, this commit covers the write
-					conn.commit()
-					return [dict(zip(colnames, r)) for r in rows]
-				else:
-					conn.commit()
-					return None
-		except Exception:
-			conn.rollback()
-			raise
+			return self._execute_on_conn(conn, query, params, autocommit=False)
 		finally:
 			self._put_conn(conn)
 
@@ -153,26 +253,15 @@ class PSQLClient:
 		"""
 		return self._execute(query, params)
 
-	def _execute_autocommit(self, query, params: Optional[Iterable] = None):
+	def _execute_autocommit(self, query, params: Optional[Iterable] = None) -> list[dict] | None:
 		"""
 		Execute a statement that must run outside a transaction (e.g., CREATE/DROP DATABASE).
 		Returns None or list[dict] like _execute.
 		"""
 		conn = self._get_conn()
-		prev = getattr(conn, "autocommit", False)
 		try:
-			if not isinstance(query, str):
-				query = query.as_string(conn)
-			conn.autocommit = True
-			with conn.cursor() as cur:
-				cur.execute(query, list(params or []))
-				if cur.description:
-					names = [d[0] for d in cur.description]
-					rows = cur.fetchall()
-					return [dict(zip(names, r)) for r in rows]
-				return None
+			return self._execute_on_conn(conn, query, params, autocommit=True)
 		finally:
-			conn.autocommit = prev
 			self._put_conn(conn)
 
 	# ---------- Database-level helpers (autocommit required) ----------
@@ -250,15 +339,27 @@ class PSQLClient:
 		"""
 		return [r["table_name"] for r in self._execute(q, [schema])]
 
-	def get_table_columns(self, schema: str, table: str) -> list[str]:
-		q = """
-			SELECT column_name
-			FROM information_schema.columns
-			WHERE table_schema = %s AND table_name = %s
-			ORDER BY ordinal_position;
-		"""
-		rows = self._execute(q, [schema, table]) or []
+	def _fetch_table_columns(self, schema: str | None, table: str) -> list[str]:
+		if schema:
+			q = """
+				SELECT column_name
+				FROM information_schema.columns
+				WHERE table_schema = %s AND table_name = %s
+				ORDER BY ordinal_position;
+			"""
+			rows = self._execute(q, [schema, table]) or []
+		else:
+			q = """
+				SELECT column_name
+				FROM information_schema.columns
+				WHERE table_name = %s
+				ORDER BY ordinal_position;
+			"""
+			rows = self._execute(q, [table]) or []
 		return [r["column_name"] for r in rows]
+
+	def get_table_columns(self, schema: str, table: str) -> list[str]:
+		return self._fetch_table_columns(schema, table)
 
 	def column_exists(self, schema: str, table: str, column: str) -> bool:
 		q = """
@@ -267,6 +368,18 @@ class PSQLClient:
 			WHERE table_schema = %s AND table_name = %s AND column_name = %s;
 		"""
 		return bool(self._execute(q, [schema, table, column]))
+
+	def _require_existing_table_columns(self, table: str) -> list[str]:
+		valid_columns = self._get_table_columns(table)
+		if not valid_columns:
+			raise ValueError(f"Table '{table}' does not exist.")
+		return valid_columns
+
+	@staticmethod
+	def _validate_known_columns(valid_columns: Sequence[str], columns: Iterable[str], label: str) -> None:
+		invalid = [c for c in columns if c not in valid_columns]
+		if invalid:
+			raise ValueError(f"Invalid columns for {label}: {invalid}")
 
 	def create_table(
 		self,
@@ -466,6 +579,135 @@ class PSQLClient:
 			return sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(table))
 		return sql.Identifier(table)
 
+	def _normalize_join_spec(self, join_entry) -> JoinSpec:
+		"""
+		Normalize join inputs into JoinSpec.
+		Accepted forms: JoinSpec, 3-tuple, or SQL string like 'LEFT JOIN x ON ...'.
+		"""
+		if isinstance(join_entry, JoinSpec):
+			join_type = join_entry.join_type
+			table_expr = join_entry.table_expr
+			on_clause = join_entry.on_clause
+		elif isinstance(join_entry, (tuple, list)):
+			if len(join_entry) != 3:
+				raise ValueError("joins tuple/list entries must have 3 items: (join_type, table_expr, on_clause).")
+			join_type, table_expr, on_clause = join_entry
+		elif isinstance(join_entry, str):
+			match = self._JOIN_RE.match(join_entry.strip())
+			if not match:
+				raise ValueError(
+					"String join entries must follow '<JOIN TYPE> JOIN <table_expr> ON <on_clause>' "
+					"or use a 3-tuple / JoinSpec."
+				)
+			join_type = match.group("join_type")
+			table_expr = match.group("table_expr")
+			on_clause = match.group("on_clause")
+		else:
+			raise ValueError("Unsupported join entry type.")
+
+		join_type = str(join_type).strip().upper()
+		if not join_type:
+			join_type = "JOIN"
+		elif "JOIN" not in join_type:
+			join_type = f"{join_type} JOIN"
+
+		table_expr = str(table_expr).strip()
+		on_clause = str(on_clause).strip()
+		if not table_expr or not on_clause:
+			raise ValueError("joins entries require non-empty table_expr and on_clause.")
+
+		return JoinSpec(join_type=join_type, table_expr=table_expr, on_clause=on_clause)
+
+	def _normalize_joins(self, joins) -> list[JoinSpec]:
+		return [self._normalize_join_spec(j) for j in (joins or [])]
+
+	def _build_select_from_clause(self, table: str, joins) -> sql.Composable:
+		from_clause = sql.SQL(" FROM ") + self._ident_qualified(table)
+		for j in self._normalize_joins(joins):
+			from_clause += sql.SQL(" {} {} ON {}").format(
+				sql.SQL(j.join_type),
+				sql.SQL(j.table_expr),
+				sql.SQL(j.on_clause),
+			)
+		return from_clause
+
+	def _build_relation_clause(self, joins, keyword: str) -> tuple[sql.Composable, list[sql.Composable]]:
+		normalized = self._normalize_joins(joins)
+		if not normalized:
+			return sql.SQL(""), []
+		clause = sql.SQL(f" {keyword} ") + sql.SQL(", ").join(sql.SQL(j.table_expr) for j in normalized)
+		on_parts = [sql.SQL(j.on_clause) for j in normalized]
+		return clause, on_parts
+
+	@staticmethod
+	def _normalize_raw_conditions(
+		raw_conditions,
+		raw_params: list | tuple | None = None,
+	) -> tuple[list[sql.Composable], list]:
+		fragments: list[sql.Composable] = []
+		params: list = []
+
+		if raw_conditions is None:
+			if raw_params:
+				raise ValueError("raw_params was provided without raw_conditions.")
+			return fragments, params
+
+		if isinstance(raw_conditions, (str, RawCondition, sql.Composable)):
+			condition_items = [raw_conditions]
+		else:
+			condition_items = list(raw_conditions)
+		if not condition_items:
+			if raw_params:
+				raise ValueError("raw_params was provided without usable raw_conditions.")
+			return fragments, params
+
+		for condition in condition_items:
+			if isinstance(condition, RawCondition):
+				expr = condition.expression.strip()
+				if not expr:
+					raise ValueError("RawCondition.expression cannot be empty.")
+				fragments.append(sql.SQL(expr))
+				params.extend(list(condition.params))
+			elif isinstance(condition, sql.Composable):
+				fragments.append(condition)
+			else:
+				expr = str(condition).strip()
+				if not expr:
+					raise ValueError("raw_conditions contains an empty SQL fragment.")
+				fragments.append(sql.SQL(expr))
+
+		if raw_params:
+			params.extend(list(raw_params))
+
+		return fragments, params
+
+	def _build_where_parts(
+		self,
+		*,
+		equalities: dict | None = None,
+		raw_conditions=None,
+		raw_params: list | tuple | None = None,
+		extra_conditions: list[sql.Composable] | None = None,
+	) -> tuple[list[sql.Composable], list]:
+		where_parts: list[sql.Composable] = []
+		params: list = []
+
+		if equalities:
+			items = list(equalities.items())
+			where_parts.extend(
+				sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder())
+				for k, _ in items
+			)
+			params.extend(v for _, v in items)
+
+		if extra_conditions:
+			where_parts.extend(extra_conditions)
+
+		raw_parts, raw_values = self._normalize_raw_conditions(raw_conditions, raw_params)
+		where_parts.extend(raw_parts)
+		params.extend(raw_values)
+		return where_parts, params
+
 	# ---------- Simple INSERT ----------
 	def insert_row(self, table: str, data: dict) -> dict | None:
 		if not data:
@@ -500,10 +742,7 @@ class PSQLClient:
 
 		conn = self._get_conn()
 		try:
-			if isinstance(query, str):
-				base = query.strip().rstrip(';')
-			else:
-				base = query.as_string(conn).strip().rstrip(';')
+			base = self._normalize_query(conn, query).strip().rstrip(';')
 
 			head = base.lstrip().split(None, 1)[0].upper() if base else ""
 			if head not in {"SELECT", "WITH"}:
@@ -530,40 +769,23 @@ class PSQLClient:
 					order_sql += f", {tb_qual} ASC"
 
 			final_sql = f"{base}{order_sql} LIMIT %s OFFSET %s;"
+			return self._execute_on_conn(conn, final_sql, params + [limit, offset], autocommit=False) or []
 		finally:
 			self._put_conn(conn)
-
-		return self._execute(final_sql, params + [limit, offset]) or []
 
 	# ---------- Column discovery for base table ----------
 	def _get_table_columns(self, table: str) -> list[str]:
 		schema, tbl = self._split_qualified(table)
-		if schema:
-			q = """
-				SELECT column_name
-				FROM information_schema.columns
-				WHERE table_schema = %s AND table_name = %s
-				ORDER BY ordinal_position;
-			"""
-			rows = self._execute(q, [schema, tbl]) or []
-		else:
-			q = """
-				SELECT column_name
-				FROM information_schema.columns
-				WHERE table_name = %s
-				ORDER BY ordinal_position;
-			"""
-			rows = self._execute(q, [tbl]) or []
-		return [r["column_name"] for r in rows]
+		return self._fetch_table_columns(schema, tbl)
 
 	# ---------- Unified SELECT with filters/joins/paging ----------
 	def get_rows_with_filters(
 		self,
 		table: str,
 		equalities: dict | None = None,
-		raw_conditions: str | list[str] | None = None,
+		raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None,
 		raw_params: list | None = None,
-		joins: list[tuple[str, str, str]] | None = None,
+		joins: list[JoinSpec | tuple[str, str, str] | str] | None = None,
 		page_limit: int = 50,
 		page_num: int = 0,
 		order_by: str | None = None,
@@ -575,14 +797,9 @@ class PSQLClient:
 		if not isinstance(page_num, int) or page_num < 0:
 			raise ValueError("page_num must be a non-negative integer.")
 
-		valid_columns = self._get_table_columns(table)
-		if not valid_columns:
-			raise ValueError(f"Table '{table}' does not exist.")
-
+		valid_columns = self._require_existing_table_columns(table)
 		if equalities:
-			invalid = [k for k in equalities if k not in valid_columns]
-			if invalid:
-				raise ValueError(f"Invalid columns for condition: {invalid}")
+			self._validate_known_columns(valid_columns, equalities.keys(), "condition")
 
 		if order_by is not None:
 			if order_by not in valid_columns:
@@ -597,41 +814,12 @@ class PSQLClient:
 
 		tiebreaker = "id" if ("id" in valid_columns and order_col != "id") else None
 
-		from_clause = sql.SQL(" FROM ") + self._ident_qualified(table)
-		if joins:
-			for j in joins:
-				if isinstance(j, str):
-					from_clause += sql.SQL(" ") + sql.SQL(j)
-				else:
-					try:
-						join_type, table_expr, on_clause = j
-					except Exception:
-						raise ValueError("joins entries must be either raw JOIN strings or 3-tuples (join_type, table_expr, on_clause).")
-					from_clause += sql.SQL(" {} {} ON {}").format(
-						sql.SQL(join_type),
-						sql.SQL(table_expr),
-						sql.SQL(on_clause)
-					)
-
-		where_parts = []
-		params = []
-
-		if equalities:
-			items = list(equalities.items())
-			where_parts.extend(
-				sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder())
-				for k, _ in items
-			)
-			params.extend(v for _, v in items)
-
-		if raw_conditions:
-			if isinstance(raw_conditions, str):
-				where_parts.append(sql.SQL(raw_conditions))
-			else:
-				for frag in raw_conditions:
-					where_parts.append(sql.SQL(frag))
-			if raw_params:
-				params.extend(list(raw_params))
+		from_clause = self._build_select_from_clause(table, joins)
+		where_parts, params = self._build_where_parts(
+			equalities=equalities,
+			raw_conditions=raw_conditions,
+			raw_params=raw_params,
+		)
 
 		where_sql = sql.SQL(" WHERE ") + sql.SQL(" AND ").join(where_parts) if where_parts else sql.SQL("")
 
@@ -662,51 +850,24 @@ class PSQLClient:
 		self,
 		table: str,
 		equalities: dict | None = None,
-		raw_conditions: str | list[str] | None = None,
+		raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None,
 		raw_params: list | None = None,
-		joins: list[tuple[str, str, str]] | None = None
+		joins: list[JoinSpec | tuple[str, str, str] | str] | None = None
 	) -> int:
-		if not equalities and not raw_conditions:
-			raise ValueError("Provide at least one of 'equalities' or 'raw_conditions'.")
+		if not equalities and not raw_conditions and not joins:
+			raise ValueError("Provide at least one of 'equalities', 'raw_conditions', or 'joins'.")
 
-		valid_columns = self._get_table_columns(table)
-		if not valid_columns:
-			raise ValueError(f"Table '{table}' does not exist.")
+		valid_columns = self._require_existing_table_columns(table)
 		if equalities:
-			invalid = [k for k in equalities if k not in valid_columns]
-			if invalid:
-				raise ValueError(f"Invalid columns for condition: {invalid}")
+			self._validate_known_columns(valid_columns, equalities.keys(), "condition")
 
-		using_clause = sql.SQL("")
-		on_parts = []
-		if joins:
-			using_bits = []
-			for _join_type, table_expr, on_clause in joins:
-				using_bits.append(sql.SQL(table_expr))
-				on_parts.append(sql.SQL(on_clause))
-			if using_bits:
-				using_clause = sql.SQL(" USING ") + sql.SQL(", ").join(using_bits)
-
-		where_parts = []
-		params = []
-
-		if equalities:
-			items = list(equalities.items())
-			where_parts.extend(
-				sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder())
-				for k, _ in items
-			)
-			params.extend(v for _, v in items)
-
-		where_parts.extend(on_parts)
-
-		if raw_conditions:
-			if isinstance(raw_conditions, str):
-				where_parts.append(sql.SQL(raw_conditions))
-			else:
-				where_parts.extend(sql.SQL(frag) for frag in raw_conditions)
-			if raw_params:
-				params.extend(list(raw_params))
+		using_clause, on_parts = self._build_relation_clause(joins, keyword="USING")
+		where_parts, params = self._build_where_parts(
+			equalities=equalities,
+			raw_conditions=raw_conditions,
+			raw_params=raw_params,
+			extra_conditions=on_parts,
+		)
 
 		if not where_parts:
 			raise ValueError("No WHERE predicates built. Refusing to delete without filters.")
@@ -726,35 +887,21 @@ class PSQLClient:
 		if not equalities:
 			raise ValueError("Conditions dictionary is empty.")
 
-		valid_columns = self._get_table_columns(table)
-		if not valid_columns:
-			raise ValueError(f"Table '{table}' does not exist.")
-
-		invalid_updates = [k for k in updates if k not in valid_columns]
-		if invalid_updates:
-			raise ValueError(f"Invalid columns for update: {invalid_updates}")
-
-		invalid_conditions = [k for k in equalities if k not in valid_columns]
-		if invalid_conditions:
-			raise ValueError(f"Invalid columns for condition: {invalid_conditions}")
+		valid_columns = self._require_existing_table_columns(table)
+		self._validate_known_columns(valid_columns, updates.keys(), "update")
+		self._validate_known_columns(valid_columns, equalities.keys(), "condition")
 
 		update_items = list(updates.items())
-		where_items = list(equalities.items())
 
 		set_clauses = [
 			sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder())
 			for k, _ in update_items
 		]
-		where_clauses = [
-			sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder())
-			for k, _ in where_items
-		]
 
 		set_sql = sql.SQL(", ").join(set_clauses)
-		where_sql = sql.SQL(" AND ").join(where_clauses)
-
 		set_params = [v for _, v in update_items]
-		where_params = [v for _, v in where_items]
+		where_parts, where_params = self._build_where_parts(equalities=equalities)
+		where_sql = sql.SQL(" AND ").join(where_parts)
 
 		query = sql.SQL("UPDATE {tbl} SET {sets} WHERE {conds} RETURNING 1;").format(
 			tbl=self._ident_qualified(table),
@@ -771,25 +918,18 @@ class PSQLClient:
 		table: str,
 		updates: dict,
 		equalities: dict | None = None,
-		raw_conditions: str | list[str] | None = None,
+		raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None,
 		raw_params: list | None = None,
-		joins: list[tuple[str, str, str]] | None = None
+		joins: list[JoinSpec | tuple[str, str, str] | str] | None = None
 	) -> int:
 		if not updates:
 			raise ValueError("Updates dictionary is empty.")
 
-		valid_columns = self._get_table_columns(table)
-		if not valid_columns:
-			raise ValueError(f"Table '{table}' does not exist.")
-
-		invalid_updates = [k for k in updates if k not in valid_columns]
-		if invalid_updates:
-			raise ValueError(f"Invalid columns for update: {invalid_updates}")
+		valid_columns = self._require_existing_table_columns(table)
+		self._validate_known_columns(valid_columns, updates.keys(), "update")
 
 		if equalities:
-			invalid_conds = [k for k in equalities if k not in valid_columns]
-			if invalid_conds:
-				raise ValueError(f"Invalid columns for condition: {invalid_conds}")
+			self._validate_known_columns(valid_columns, equalities.keys(), "condition")
 
 		update_items = list(updates.items())
 		set_clauses = [
@@ -799,36 +939,13 @@ class PSQLClient:
 		set_sql = sql.SQL(", ").join(set_clauses)
 		set_params = [v for _, v in update_items]
 
-		from_clause = sql.SQL("")
-		on_parts = []
-		if joins:
-			from_bits = []
-			for _join_type, table_expr, on_clause in joins:
-				from_bits.append(sql.SQL(table_expr))
-				on_parts.append(sql.SQL(on_clause))
-			if from_bits:
-				from_clause = sql.SQL(" FROM ") + sql.SQL(", ").join(from_bits)
-
-		where_parts = []
-		params = []
-
-		if equalities:
-			where_items = list(equalities.items())
-			where_parts.extend(
-				sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder())
-				for k, _ in where_items
-			)
-			params.extend(v for _, v in where_items)
-
-		where_parts.extend(on_parts)
-
-		if raw_conditions:
-			if isinstance(raw_conditions, str):
-				where_parts.append(sql.SQL(raw_conditions))
-			else:
-				where_parts.extend(sql.SQL(frag) for frag in raw_conditions)
-			if raw_params:
-				params.extend(list(raw_params))
+		from_clause, on_parts = self._build_relation_clause(joins, keyword="FROM")
+		where_parts, params = self._build_where_parts(
+			equalities=equalities,
+			raw_conditions=raw_conditions,
+			raw_params=raw_params,
+			extra_conditions=on_parts,
+		)
 
 		if not where_parts:
 			raise ValueError("No WHERE predicates built. Refusing to update without filters.")
