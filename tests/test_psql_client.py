@@ -333,6 +333,31 @@ class TestExecutionInternals(PSQLClientTestCase):
         exec_on_conn2.assert_called_once_with(conn, "CREATE DATABASE demo", None, autocommit=True)
         pool.putconn.assert_called_once_with(conn)
 
+    def test_transaction_commit_and_rollback(self):
+        conn = FakeConnection()
+        pool = mock.Mock()
+        pool.getconn.return_value = conn
+        client = make_client(pool=pool)
+
+        with client.transaction() as tx:
+            tx.execute("SELECT 1", [7])
+        self.assertEqual(conn.commit_calls, 1)
+        self.assertEqual(conn.rollback_calls, 0)
+        pool.putconn.assert_called_once_with(conn)
+
+        conn2 = FakeConnection()
+        pool2 = mock.Mock()
+        pool2.getconn.return_value = conn2
+        client2 = make_client(pool=pool2)
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            with client2.transaction() as tx2:
+                tx2.execute("SELECT 1")
+                raise RuntimeError("boom")
+        self.assertEqual(conn2.commit_calls, 0)
+        self.assertEqual(conn2.rollback_calls, 1)
+        pool2.putconn.assert_called_once_with(conn2)
+
 
 class TestDDLAndMetadataHelpers(PSQLClientTestCase):
     def test_boolean_existence_helpers(self):
@@ -574,6 +599,198 @@ class TestDataAccessFlows(PSQLClientTestCase):
         self.assertEqual(row, {"id": 1, "name": "Alice"})
         self.assertEqual(execute_mock.call_args.args[1], ["Alice", True])
         self.assertIn('INSERT INTO "public"."users"', render(execute_mock.call_args.args[0]))
+
+    def test_bulk_insert(self):
+        client = make_client()
+
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            client.bulk_insert("users", [{"id": 1}], chunk_size=0)
+
+        with self.assertRaisesRegex(ValueError, "requires do_nothing=True"):
+            client.bulk_insert("users", [{"id": 1}], conflict_columns=["id"])
+
+        with self.assertRaisesRegex(ValueError, "non-empty sequence"):
+            client.bulk_insert("users", [])
+
+        with self.assertRaisesRegex(ValueError, "same keys"):
+            client.bulk_insert("users", [{"id": 1}, {"id": 2, "name": "n"}])
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name"]), \
+             mock.patch.object(client, "_execute", side_effect=[[{"?column?": 1}], [{"?column?": 1}]]) as execute_mock:
+            affected = client.bulk_insert(
+                "users",
+                [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}],
+                chunk_size=1,
+                do_nothing=True,
+                conflict_columns=["id"],
+            )
+        self.assertEqual(affected, 2)
+        self.assertEqual(execute_mock.call_count, 2)
+        self.assertEqual(execute_mock.call_args_list[0].args[1], [1, "A"])
+        self.assertIn('INSERT INTO "users"', render(execute_mock.call_args_list[0].args[0]))
+        self.assertIn('ON CONFLICT ("id") DO NOTHING', render(execute_mock.call_args_list[0].args[0]))
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name"]), \
+             mock.patch.object(client, "_execute", side_effect=[[{"id": 1}], [{"id": 2}]]) as execute_mock2:
+            rows = client.bulk_insert(
+                "users",
+                [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}],
+                chunk_size=1,
+                returning=True,
+            )
+        self.assertEqual(rows, [{"id": 1}, {"id": 2}])
+        self.assertIn("RETURNING *", render(execute_mock2.call_args_list[0].args[0]))
+
+    def test_upsert_row_and_upsert_rows(self):
+        client = make_client()
+
+        with self.assertRaisesRegex(ValueError, "empty"):
+            client.upsert_row("users", {}, conflict_columns=["id"])
+
+        with self.assertRaisesRegex(ValueError, "non-empty sequence"):
+            client.upsert_row("users", {"id": 1}, conflict_columns=[])
+
+        with self.assertRaisesRegex(ValueError, "cannot be used when do_nothing=True"):
+            client.upsert_row("users", {"id": 1}, conflict_columns=["id"], update_columns=["id"], do_nothing=True)
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name", "active"]), \
+             mock.patch.object(client, "_execute", return_value=[{"id": 1, "name": "Alice"}]) as execute_mock:
+            row = client.upsert_row(
+                "users",
+                {"id": 1, "name": "Alice", "active": True},
+                conflict_columns=["id"],
+                update_columns=["name", "active"],
+            )
+        self.assertEqual(row, {"id": 1, "name": "Alice"})
+        self.assertEqual(execute_mock.call_args.args[1], [1, "Alice", True])
+        query_text = render(execute_mock.call_args.args[0])
+        self.assertIn('ON CONFLICT ("id") DO UPDATE SET', query_text)
+        self.assertIn('"name" = EXCLUDED."name"', query_text)
+        self.assertIn('"active" = EXCLUDED."active"', query_text)
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name"]), \
+             mock.patch.object(client, "_execute", return_value=[]) as execute_mock2:
+            out = client.upsert_row(
+                "users",
+                {"id": 1, "name": "Alice"},
+                conflict_columns=["id"],
+                do_nothing=True,
+            )
+        self.assertIsNone(out)
+        self.assertIn("DO NOTHING", render(execute_mock2.call_args.args[0]))
+
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            client.upsert_rows("users", [{"id": 1}], conflict_columns=["id"], chunk_size=0)
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name"]), \
+             mock.patch.object(client, "_execute", side_effect=[[{"?column?": 1}, {"?column?": 1}], [{"?column?": 1}]]) as execute_mock3:
+            affected = client.upsert_rows(
+                "users",
+                [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}, {"id": 3, "name": "C"}],
+                conflict_columns=["id"],
+                chunk_size=2,
+                returning=False,
+            )
+        self.assertEqual(affected, 3)
+        self.assertEqual(execute_mock3.call_count, 2)
+        self.assertIn('ON CONFLICT ("id") DO UPDATE SET', render(execute_mock3.call_args_list[0].args[0]))
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name"]), \
+             mock.patch.object(client, "_execute", return_value=[{"id": 1}, {"id": 2}]) as execute_mock4:
+            rows = client.upsert_rows(
+                "users",
+                [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}],
+                conflict_columns=["id"],
+                returning=True,
+                do_nothing=True,
+            )
+        self.assertEqual(rows, [{"id": 1}, {"id": 2}])
+        self.assertIn("DO NOTHING", render(execute_mock4.call_args.args[0]))
+
+    def test_count_exists_and_single_row_helpers(self):
+        client = make_client()
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id"]), \
+             mock.patch.object(client, "_build_select_from_clause", return_value=sql.SQL(' FROM "users"')), \
+             mock.patch.object(client, "_build_where_parts", return_value=([], [])), \
+             mock.patch.object(client, "_execute", return_value=[{"cnt": 4}]):
+            count = client.count_rows_with_filters("users")
+        self.assertEqual(count, 4)
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id"]), \
+             mock.patch.object(client, "_build_select_from_clause", return_value=sql.SQL(' FROM "users"')), \
+             mock.patch.object(client, "_build_where_parts", return_value=([], [])), \
+             mock.patch.object(client, "_execute", return_value=[{"?column?": 1}]):
+            self.assertTrue(client.exists_with_filters("users"))
+
+        with mock.patch.object(client, "get_rows_with_filters", return_value=([{"id": 1}], 1)):
+            row = client.get_optional_one("users")
+        self.assertEqual(row, {"id": 1})
+
+        with mock.patch.object(client, "get_rows_with_filters", return_value=([], 0)):
+            row2 = client.get_optional_one("users")
+        self.assertIsNone(row2)
+
+        with mock.patch.object(client, "count_rows_with_filters", return_value=0):
+            with self.assertRaisesRegex(LookupError, "No rows"):
+                client.get_one("users")
+
+        with mock.patch.object(client, "count_rows_with_filters", return_value=2):
+            with self.assertRaisesRegex(ValueError, "exactly one row"):
+                client.get_one("users")
+
+        with mock.patch.object(client, "count_rows_with_filters", return_value=1), \
+             mock.patch.object(client, "get_optional_one", return_value={"id": 1}):
+            row3 = client.get_one("users")
+        self.assertEqual(row3, {"id": 1})
+
+    def test_get_or_create_and_update_or_create(self):
+        client = make_client()
+
+        with self.assertRaisesRegex(ValueError, "non-empty dictionary"):
+            client.get_or_create("users", {})
+
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            client.get_or_create("users", {"id": 1}, defaults={"id": 2})
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name", "active"]), \
+             mock.patch.object(client, "get_optional_one", return_value={"id": 1, "name": "A"}) as get_one_mock, \
+             mock.patch.object(client, "insert_row") as insert_mock:
+            row, created = client.get_or_create("users", {"id": 1}, defaults={"name": "A"})
+        self.assertFalse(created)
+        self.assertEqual(row, {"id": 1, "name": "A"})
+        get_one_mock.assert_called_once()
+        insert_mock.assert_not_called()
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name"]), \
+             mock.patch.object(client, "get_optional_one", return_value=None), \
+             mock.patch.object(client, "insert_row", return_value={"id": 2, "name": "B"}) as insert_mock2:
+            row2, created2 = client.get_or_create("users", {"id": 2}, defaults={"name": "B"})
+        self.assertTrue(created2)
+        self.assertEqual(row2, {"id": 2, "name": "B"})
+        insert_mock2.assert_called_once_with("users", {"id": 2, "name": "B"})
+
+        with self.assertRaisesRegex(ValueError, "non-empty dictionary"):
+            client.update_or_create("users", {})
+
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            client.update_or_create("users", {"id": 1}, {"id": 2})
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name"]), \
+             mock.patch.object(client, "get_optional_one", side_effect=[{"id": 1, "name": "Old"}, {"id": 1, "name": "New"}]), \
+             mock.patch.object(client, "update_rows_with_equalities") as update_mock:
+            row3, created3 = client.update_or_create("users", {"id": 1}, {"name": "New"})
+        self.assertFalse(created3)
+        self.assertEqual(row3, {"id": 1, "name": "New"})
+        update_mock.assert_called_once_with("users", {"name": "New"}, {"id": 1})
+
+        with mock.patch.object(client, "_require_existing_table_columns", return_value=["id", "name"]), \
+             mock.patch.object(client, "get_optional_one", return_value=None), \
+             mock.patch.object(client, "insert_row", return_value={"id": 3, "name": "C"}) as insert_mock3:
+            row4, created4 = client.update_or_create("users", {"id": 3}, {"name": "C"})
+        self.assertTrue(created4)
+        self.assertEqual(row4, {"id": 3, "name": "C"})
+        insert_mock3.assert_called_once_with("users", {"id": 3, "name": "C"})
 
     def test_paged_execute_validation_and_sql(self):
         client = make_client()

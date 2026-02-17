@@ -1,5 +1,6 @@
 import logging
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from math import ceil
 from threading import RLock
@@ -189,6 +190,43 @@ class PSQLClient:
 			with self._state_lock:
 				if not self._closed:
 					raise
+
+	class _Transaction:
+		"""
+		Transaction-scoped executor that reuses one checked-out connection.
+		"""
+		def __init__(self, client: "PSQLClient", conn):
+			self._client = client
+			self._conn = conn
+
+		def execute(self, query, params: Optional[Iterable] = None) -> list[dict] | None:
+			query_text = self._client._normalize_query(self._conn, query)
+			with self._conn.cursor() as cur:
+				cur.execute(query_text, list(params or []))
+				return self._client._rows_from_cursor(cur)
+
+	@contextmanager
+	def transaction(self):
+		"""
+		Provide a transaction context that commits once on success and rolls back on error.
+
+		Usage:
+			with client.transaction() as tx:
+				tx.execute("INSERT ...", [...])
+				tx.execute("UPDATE ...", [...])
+		"""
+		conn = self._get_conn()
+		prev_autocommit = getattr(conn, "autocommit", False)
+		try:
+			conn.autocommit = False
+			yield self._Transaction(self, conn)
+			conn.commit()
+		except Exception:
+			conn.rollback()
+			raise
+		finally:
+			conn.autocommit = prev_autocommit
+			self._put_conn(conn)
 
 	# ---------- Execution helpers ----------
 	@staticmethod
@@ -708,6 +746,26 @@ class PSQLClient:
 		params.extend(raw_values)
 		return where_parts, params
 
+	@staticmethod
+	def _prepare_bulk_rows(rows: Sequence[dict]) -> tuple[list[str], list[list[Any]]]:
+		if not rows:
+			raise ValueError("rows must be a non-empty sequence of dictionaries.")
+		first = rows[0]
+		if not isinstance(first, dict) or not first:
+			raise ValueError("rows[0] must be a non-empty dictionary.")
+
+		columns = list(first.keys())
+		expected = set(columns)
+		value_rows: list[list[Any]] = []
+		for idx, row in enumerate(rows):
+			if not isinstance(row, dict) or not row:
+				raise ValueError(f"rows[{idx}] must be a non-empty dictionary.")
+			if set(row.keys()) != expected:
+				raise ValueError("All rows must contain the same keys.")
+			value_rows.append([row[c] for c in columns])
+
+		return columns, value_rows
+
 	# ---------- Simple INSERT ----------
 	def insert_row(self, table: str, data: dict) -> dict | None:
 		if not data:
@@ -724,6 +782,274 @@ class PSQLClient:
 		)
 		result = self._execute(query, values)
 		return result[0] if result else None
+
+	def bulk_insert(
+		self,
+		table: str,
+		rows: Sequence[dict],
+		*,
+		chunk_size: int = 500,
+		returning: bool = False,
+		do_nothing: bool = False,
+		conflict_columns: Sequence[str] | None = None,
+	) -> list[dict] | int:
+		"""
+		Insert many rows in chunks.
+
+		When returning=False, returns affected row count.
+		When returning=True, returns returned rows.
+		"""
+		if not isinstance(chunk_size, int) or chunk_size <= 0:
+			raise ValueError("chunk_size must be a positive integer.")
+		if conflict_columns and not do_nothing:
+			raise ValueError("conflict_columns requires do_nothing=True in bulk_insert.")
+
+		columns, value_rows = self._prepare_bulk_rows(rows)
+
+		valid_columns = self._require_existing_table_columns(table)
+		self._validate_known_columns(valid_columns, columns, "insert")
+		if conflict_columns:
+			self._validate_known_columns(valid_columns, conflict_columns, "conflict")
+
+		row_placeholders = sql.SQL("(") + sql.SQL(", ").join(sql.Placeholder() for _ in columns) + sql.SQL(")")
+		inserted_rows: list[dict] = []
+		affected = 0
+
+		for start in range(0, len(value_rows), chunk_size):
+			chunk = value_rows[start:start + chunk_size]
+			values_clause = sql.SQL(", ").join(row_placeholders for _ in chunk)
+			query = sql.SQL("INSERT INTO {tbl} ({fields}) VALUES {values}").format(
+				tbl=self._ident_qualified(table),
+				fields=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+				values=values_clause,
+			)
+
+			if do_nothing:
+				if conflict_columns:
+					query += sql.SQL(" ON CONFLICT ({}) DO NOTHING").format(
+						sql.SQL(", ").join(sql.Identifier(c) for c in conflict_columns)
+					)
+				else:
+					query += sql.SQL(" ON CONFLICT DO NOTHING")
+
+			if returning:
+				query += sql.SQL(" RETURNING *;")
+			else:
+				query += sql.SQL(" RETURNING 1;")
+
+			params = [value for row_values in chunk for value in row_values]
+			result = self._execute(query, params) or []
+
+			if returning:
+				inserted_rows.extend(result)
+			else:
+				affected += len(result)
+
+		return inserted_rows if returning else affected
+
+	def upsert_row(
+		self,
+		table: str,
+		data: dict,
+		*,
+		conflict_columns: Sequence[str],
+		update_columns: Sequence[str] | None = None,
+		do_nothing: bool = False,
+		returning: bool = True,
+	) -> dict | None:
+		"""
+		Insert one row and resolve conflicts via DO UPDATE or DO NOTHING.
+		"""
+		if not data:
+			raise ValueError("Data dictionary is empty.")
+		if not conflict_columns:
+			raise ValueError("conflict_columns must be a non-empty sequence.")
+		if do_nothing and update_columns is not None:
+			raise ValueError("update_columns cannot be used when do_nothing=True.")
+
+		columns = list(data.keys())
+		values = [data[c] for c in columns]
+		valid_columns = self._require_existing_table_columns(table)
+		self._validate_known_columns(valid_columns, columns, "insert")
+		self._validate_known_columns(valid_columns, conflict_columns, "conflict")
+
+		if update_columns is None:
+			update_cols = [c for c in columns if c not in set(conflict_columns)]
+		else:
+			update_cols = list(update_columns)
+			self._validate_known_columns(valid_columns, update_cols, "update")
+			missing = [c for c in update_cols if c not in data]
+			if missing:
+				raise ValueError(f"update_columns must exist in input data: {missing}")
+
+		query = sql.SQL(
+			"INSERT INTO {tbl} ({fields}) VALUES ({placeholders}) ON CONFLICT ({conflicts})"
+		).format(
+			tbl=self._ident_qualified(table),
+			fields=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+			placeholders=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+			conflicts=sql.SQL(", ").join(sql.Identifier(c) for c in conflict_columns),
+		)
+
+		if do_nothing or not update_cols:
+			query += sql.SQL(" DO NOTHING")
+		else:
+			set_sql = sql.SQL(", ").join(
+				sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
+				for c in update_cols
+			)
+			query += sql.SQL(" DO UPDATE SET ") + set_sql
+
+		if returning:
+			query += sql.SQL(" RETURNING *;")
+			result = self._execute(query, values)
+			return result[0] if result else None
+
+		self._execute(query, values)
+		return None
+
+	def upsert_rows(
+		self,
+		table: str,
+		rows: Sequence[dict],
+		*,
+		conflict_columns: Sequence[str],
+		update_columns: Sequence[str] | None = None,
+		do_nothing: bool = False,
+		chunk_size: int = 500,
+		returning: bool = False,
+	) -> list[dict] | int:
+		"""
+		Batch upsert with configurable conflict behavior.
+		"""
+		if not conflict_columns:
+			raise ValueError("conflict_columns must be a non-empty sequence.")
+		if not isinstance(chunk_size, int) or chunk_size <= 0:
+			raise ValueError("chunk_size must be a positive integer.")
+		if do_nothing and update_columns is not None:
+			raise ValueError("update_columns cannot be used when do_nothing=True.")
+
+		columns, value_rows = self._prepare_bulk_rows(rows)
+
+		valid_columns = self._require_existing_table_columns(table)
+		self._validate_known_columns(valid_columns, columns, "insert")
+		self._validate_known_columns(valid_columns, conflict_columns, "conflict")
+
+		if update_columns is None:
+			update_cols = [c for c in columns if c not in set(conflict_columns)]
+		else:
+			update_cols = list(update_columns)
+			self._validate_known_columns(valid_columns, update_cols, "update")
+			missing = [c for c in update_cols if c not in columns]
+			if missing:
+				raise ValueError(f"update_columns must exist in row payloads: {missing}")
+
+		row_placeholders = sql.SQL("(") + sql.SQL(", ").join(sql.Placeholder() for _ in columns) + sql.SQL(")")
+		all_rows: list[dict] = []
+		affected = 0
+
+		for start in range(0, len(value_rows), chunk_size):
+			chunk = value_rows[start:start + chunk_size]
+			values_clause = sql.SQL(", ").join(row_placeholders for _ in chunk)
+			query = sql.SQL(
+				"INSERT INTO {tbl} ({fields}) VALUES {values} ON CONFLICT ({conflicts})"
+			).format(
+				tbl=self._ident_qualified(table),
+				fields=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+				values=values_clause,
+				conflicts=sql.SQL(", ").join(sql.Identifier(c) for c in conflict_columns),
+			)
+
+			if do_nothing or not update_cols:
+				query += sql.SQL(" DO NOTHING")
+			else:
+				set_sql = sql.SQL(", ").join(
+					sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
+					for c in update_cols
+				)
+				query += sql.SQL(" DO UPDATE SET ") + set_sql
+
+			if returning:
+				query += sql.SQL(" RETURNING *;")
+			else:
+				query += sql.SQL(" RETURNING 1;")
+
+			params = [value for row_values in chunk for value in row_values]
+			result = self._execute(query, params) or []
+
+			if returning:
+				all_rows.extend(result)
+			else:
+				affected += len(result)
+
+		return all_rows if returning else affected
+
+	def get_or_create(self, table: str, lookup: dict, defaults: dict | None = None) -> tuple[dict, bool]:
+		"""
+		Fetch one row by equality lookup or create it.
+		Returns (row, created).
+		"""
+		if not lookup:
+			raise ValueError("lookup must be a non-empty dictionary.")
+		defaults = defaults or {}
+		overlap = sorted(set(lookup.keys()) & set(defaults.keys()))
+		if overlap:
+			raise ValueError(f"lookup and defaults overlap on keys: {overlap}")
+
+		valid_columns = self._require_existing_table_columns(table)
+		self._validate_known_columns(valid_columns, lookup.keys(), "lookup")
+		if defaults:
+			self._validate_known_columns(valid_columns, defaults.keys(), "defaults")
+
+		existing = self.get_optional_one(table, equalities=lookup)
+		if existing is not None:
+			return existing, False
+
+		payload = dict(lookup)
+		payload.update(defaults)
+		created = self.insert_row(table, payload)
+		if created is None:
+			refetched = self.get_optional_one(table, equalities=payload)
+			if refetched is None:
+				raise RuntimeError("insert_row did not return data and refetch failed.")
+			return refetched, True
+		return created, True
+
+	def update_or_create(self, table: str, lookup: dict, updates: dict | None = None) -> tuple[dict, bool]:
+		"""
+		Fetch one row by lookup and update it, or create when absent.
+		Returns (row, created).
+		"""
+		if not lookup:
+			raise ValueError("lookup must be a non-empty dictionary.")
+		updates = updates or {}
+		overlap = sorted(set(lookup.keys()) & set(updates.keys()))
+		if overlap:
+			raise ValueError(f"lookup and updates overlap on keys: {overlap}")
+
+		valid_columns = self._require_existing_table_columns(table)
+		self._validate_known_columns(valid_columns, lookup.keys(), "lookup")
+		if updates:
+			self._validate_known_columns(valid_columns, updates.keys(), "update")
+
+		existing = self.get_optional_one(table, equalities=lookup)
+		if existing is not None:
+			if updates:
+				self.update_rows_with_equalities(table, updates, lookup)
+				refetched = self.get_optional_one(table, equalities=lookup)
+				if refetched is not None:
+					return refetched, False
+			return existing, False
+
+		payload = dict(lookup)
+		payload.update(updates)
+		created = self.insert_row(table, payload)
+		if created is None:
+			refetched = self.get_optional_one(table, equalities=payload)
+			if refetched is None:
+				raise RuntimeError("insert_row did not return data and refetch failed.")
+			return refetched, True
+		return created, True
 
 	# ---------- Pagination core ----------
 	def _paged_execute(
@@ -844,6 +1170,122 @@ class PSQLClient:
 		) or []
 
 		return rows, total_pages
+
+	def count_rows_with_filters(
+		self,
+		table: str,
+		equalities: dict | None = None,
+		raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None,
+		raw_params: list | None = None,
+		joins: list[JoinSpec | tuple[str, str, str] | str] | None = None,
+	) -> int:
+		"""
+		Return the number of rows matching the provided filter conditions.
+		"""
+		valid_columns = self._require_existing_table_columns(table)
+		if equalities:
+			self._validate_known_columns(valid_columns, equalities.keys(), "condition")
+
+		from_clause = self._build_select_from_clause(table, joins)
+		where_parts, params = self._build_where_parts(
+			equalities=equalities,
+			raw_conditions=raw_conditions,
+			raw_params=raw_params,
+		)
+		where_sql = sql.SQL(" WHERE ") + sql.SQL(" AND ").join(where_parts) if where_parts else sql.SQL("")
+
+		q = sql.SQL("SELECT COUNT(*) AS cnt") + from_clause + where_sql + sql.SQL(";")
+		result = self._execute(q, params)
+		return int(result[0]["cnt"]) if result else 0
+
+	def exists_with_filters(
+		self,
+		table: str,
+		equalities: dict | None = None,
+		raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None,
+		raw_params: list | None = None,
+		joins: list[JoinSpec | tuple[str, str, str] | str] | None = None,
+	) -> bool:
+		"""
+		Return True if at least one row matches filters.
+		"""
+		valid_columns = self._require_existing_table_columns(table)
+		if equalities:
+			self._validate_known_columns(valid_columns, equalities.keys(), "condition")
+
+		from_clause = self._build_select_from_clause(table, joins)
+		where_parts, params = self._build_where_parts(
+			equalities=equalities,
+			raw_conditions=raw_conditions,
+			raw_params=raw_params,
+		)
+		where_sql = sql.SQL(" WHERE ") + sql.SQL(" AND ").join(where_parts) if where_parts else sql.SQL("")
+		q = sql.SQL("SELECT 1") + from_clause + where_sql + sql.SQL(" LIMIT 1;")
+		return bool(self._execute(q, params))
+
+	def get_optional_one(
+		self,
+		table: str,
+		equalities: dict | None = None,
+		raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None,
+		raw_params: list | None = None,
+		joins: list[JoinSpec | tuple[str, str, str] | str] | None = None,
+		order_by: str | None = None,
+		order_dir: str = "ASC",
+	) -> dict | None:
+		"""
+		Return one row or None.
+		"""
+		rows, _ = self.get_rows_with_filters(
+			table,
+			equalities=equalities,
+			raw_conditions=raw_conditions,
+			raw_params=raw_params,
+			joins=joins,
+			page_limit=1,
+			page_num=0,
+			order_by=order_by,
+			order_dir=order_dir,
+		)
+		return rows[0] if rows else None
+
+	def get_one(
+		self,
+		table: str,
+		equalities: dict | None = None,
+		raw_conditions: RawCondition | sql.Composable | str | list[RawCondition | sql.Composable | str] | None = None,
+		raw_params: list | None = None,
+		joins: list[JoinSpec | tuple[str, str, str] | str] | None = None,
+		order_by: str | None = None,
+		order_dir: str = "ASC",
+	) -> dict:
+		"""
+		Return exactly one row, raising when none or multiple rows match.
+		"""
+		total = self.count_rows_with_filters(
+			table,
+			equalities=equalities,
+			raw_conditions=raw_conditions,
+			raw_params=raw_params,
+			joins=joins,
+		)
+		if total == 0:
+			raise LookupError("No rows matched filters.")
+		if total > 1:
+			raise ValueError(f"Expected exactly one row, found {total}.")
+
+		row = self.get_optional_one(
+			table,
+			equalities=equalities,
+			raw_conditions=raw_conditions,
+			raw_params=raw_params,
+			joins=joins,
+			order_by=order_by,
+			order_dir=order_dir,
+		)
+		if row is None:
+			raise LookupError("No rows matched filters.")
+		return row
 
 	# ---------- DELETE with filters/joins ----------
 	def delete_rows_with_filters(

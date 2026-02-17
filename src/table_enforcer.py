@@ -22,6 +22,8 @@ class TableEnforcer:
 
     def __init__(self, client: PSQLClient):
         self.client = client
+        self._plan_only = False
+        self._planned_actions: list[str] = []
 
     def enforce(
         self,
@@ -33,7 +35,8 @@ class TableEnforcer:
         safe_mode: bool = True,
         drop_tables_not_in_config: bool = False,
         cleanup_not_null_rows: bool = True,
-    ) -> set[tuple[str, str]]:
+        plan_only: bool = False,
+    ) -> set[tuple[str, str]] | tuple[set[tuple[str, str]], list[str]]:
         """
         Enforce schema from one or more config sources.
 
@@ -53,50 +56,182 @@ class TableEnforcer:
                 Drop DB tables not present in the loaded configs for configured schemas.
             cleanup_not_null_rows:
                 In forceful mode, delete NULL rows before enforcing NOT NULL.
+            plan_only:
+                True => return planned actions without applying DDL/DML changes.
 
         Returns:
-            Set of (schema, table) entries that were enforced.
+            If plan_only=False: set of (schema, table) entries that were enforced.
+            If plan_only=True: tuple of (configured_tables, planned_actions).
         """
-        target_schema, target_table = self._parse_table_target(table)
-        sources = self._load_sources(
-            config_dir=config_dir,
-            config_files=config_files,
-            config_payloads=config_payloads,
-        )
+        self._plan_only = bool(plan_only)
+        self._planned_actions = []
+        try:
+            target_schema, target_table = self._parse_table_target(table)
+            sources = self._load_sources(
+                config_dir=config_dir,
+                config_files=config_files,
+                config_payloads=config_payloads,
+            )
 
-        configured: set[tuple[str, str]] = set()
-        for source_name, cfg in sources:
-            tables = self._normalise_tables_config(cfg)
-            for t in tables:
-                schema = t.get("schema", "public")
-                name = t.get("table_name")
-                if not name:
-                    raise ValueError(f"Config source '{source_name}' has entry missing 'table_name'.")
+            configured: set[tuple[str, str]] = set()
+            for source_name, cfg in sources:
+                tables = self.validate_config(cfg, source_name=source_name)
+                for t in tables:
+                    schema = t.get("schema", "public")
+                    name = t.get("table_name")
+                    if not name:
+                        raise ValueError(f"Config source '{source_name}' has entry missing 'table_name'.")
 
-                if target_table and name != target_table:
-                    continue
-                if target_schema and schema != target_schema:
-                    continue
+                    if target_table and name != target_table:
+                        continue
+                    if target_schema and schema != target_schema:
+                        continue
 
-                self._verify_one_table(
-                    t,
-                    safe_mode=safe_mode,
-                    cleanup_not_null_rows=cleanup_not_null_rows,
-                )
-                configured.add((schema, name))
+                    self._verify_one_table(
+                        t,
+                        safe_mode=safe_mode,
+                        cleanup_not_null_rows=cleanup_not_null_rows,
+                    )
+                    configured.add((schema, name))
 
-        if table and not configured:
-            raise ValueError(f"Target table '{table}' was not found in provided config sources.")
+            if table and not configured:
+                raise ValueError(f"Target table '{table}' was not found in provided config sources.")
 
-        if drop_tables_not_in_config:
-            if table:
-                raise ValueError(
-                    "drop_tables_not_in_config cannot be used with a single table filter. "
-                    "Run without 'table' to perform schema-level cleanup."
-                )
-            self._drop_unconfigured_tables(configured)
+            if drop_tables_not_in_config:
+                if table:
+                    raise ValueError(
+                        "drop_tables_not_in_config cannot be used with a single table filter. "
+                        "Run without 'table' to perform schema-level cleanup."
+                    )
+                self._drop_unconfigured_tables(configured)
 
-        return configured
+            if self._plan_only:
+                return configured, list(self._planned_actions)
+            return configured
+        finally:
+            self._plan_only = False
+
+    @property
+    def last_plan(self) -> list[str]:
+        return list(self._planned_actions)
+
+    def _record_action(self, action: str) -> None:
+        self._planned_actions.append(action)
+
+    def _apply_action(self, action: str, fn, *args, **kwargs):
+        self._record_action(action)
+        if self._plan_only:
+            return None
+        return fn(*args, **kwargs)
+
+    def validate_config(self, cfg: dict | list, *, source_name: str = "<config>") -> list[dict]:
+        """
+        Validate a config payload and return normalized table entries.
+        Raises ValueError when schema is invalid.
+        """
+        tables = self._normalise_tables_config(cfg)
+        if not tables:
+            raise ValueError(f"Config source '{source_name}' does not define any tables.")
+
+        for i, t in enumerate(tables):
+            if not isinstance(t, dict):
+                raise ValueError(f"Config source '{source_name}' table entry #{i} must be an object.")
+
+            table_name = t.get("table_name")
+            if not isinstance(table_name, str) or not table_name.strip():
+                raise ValueError(f"Config source '{source_name}' table entry #{i} has invalid 'table_name'.")
+
+            schema = t.get("schema", "public")
+            if not isinstance(schema, str) or not schema.strip():
+                raise ValueError(f"Config source '{source_name}' table '{table_name}' has invalid 'schema'.")
+
+            columns_cfg = t.get("columns")
+            if not isinstance(columns_cfg, list) or not columns_cfg:
+                raise ValueError(f"Config source '{source_name}' table '{table_name}' must have non-empty 'columns'.")
+
+            seen_colnames: set[str] = set()
+            for col_idx, c in enumerate(columns_cfg):
+                if not isinstance(c, dict):
+                    raise ValueError(
+                        f"Config source '{source_name}' table '{table_name}' column #{col_idx} must be an object."
+                    )
+                col_name = c.get("name")
+                if not isinstance(col_name, str) or not col_name.strip():
+                    raise ValueError(
+                        f"Config source '{source_name}' table '{table_name}' column #{col_idx} has invalid 'name'."
+                    )
+                if col_name in seen_colnames:
+                    raise ValueError(
+                        f"Config source '{source_name}' table '{table_name}' has duplicate column '{col_name}'."
+                    )
+                seen_colnames.add(col_name)
+
+                if "type" not in c and not c.get("raw_type"):
+                    raise ValueError(
+                        f"Config source '{source_name}' table '{table_name}' column '{col_name}' "
+                        "must define 'type' or 'raw_type'."
+                    )
+                self._column_type_sql(c)
+
+                fk = c.get("foreign_key")
+                if fk is not None:
+                    if not isinstance(fk, dict):
+                        raise ValueError(
+                            f"Config source '{source_name}' table '{table_name}' column '{col_name}' "
+                            "foreign_key must be an object."
+                        )
+                    fk_table = fk.get("table")
+                    fk_column = fk.get("column")
+                    if not isinstance(fk_table, str) or not fk_table.strip():
+                        raise ValueError(
+                            f"Config source '{source_name}' table '{table_name}' column '{col_name}' "
+                            "foreign_key.table must be a non-empty string."
+                        )
+                    if not isinstance(fk_column, str) or not fk_column.strip():
+                        raise ValueError(
+                            f"Config source '{source_name}' table '{table_name}' column '{col_name}' "
+                            "foreign_key.column must be a non-empty string."
+                        )
+
+                enum_vals = c.get("enum")
+                if enum_vals is not None:
+                    if not isinstance(enum_vals, list) or not enum_vals:
+                        raise ValueError(
+                            f"Config source '{source_name}' table '{table_name}' column '{col_name}' "
+                            "enum must be a non-empty list."
+                        )
+
+            indexes_cfg = t.get("indexes", [])
+            if not isinstance(indexes_cfg, list):
+                raise ValueError(f"Config source '{source_name}' table '{table_name}' has invalid 'indexes'.")
+            seen_indexes: set[str] = set()
+            for idx in indexes_cfg:
+                if not isinstance(idx, dict):
+                    raise ValueError(f"Config source '{source_name}' table '{table_name}' index entries must be objects.")
+                idx_name = idx.get("name")
+                if not isinstance(idx_name, str) or not idx_name.strip():
+                    raise ValueError(
+                        f"Config source '{source_name}' table '{table_name}' has index with invalid 'name'."
+                    )
+                if idx_name in seen_indexes:
+                    raise ValueError(
+                        f"Config source '{source_name}' table '{table_name}' has duplicate index name '{idx_name}'."
+                    )
+                seen_indexes.add(idx_name)
+                idx_cols = idx.get("columns")
+                if not isinstance(idx_cols, list) or not idx_cols:
+                    raise ValueError(
+                        f"Config source '{source_name}' table '{table_name}' index '{idx_name}' "
+                        "must have non-empty 'columns'."
+                    )
+                missing_cols = [c for c in idx_cols if c not in seen_colnames]
+                if missing_cols:
+                    raise ValueError(
+                        f"Config source '{source_name}' table '{table_name}' index '{idx_name}' "
+                        f"references unknown columns: {missing_cols}"
+                    )
+
+        return tables
 
     def _parse_table_target(self, table: str | None) -> tuple[str | None, str | None]:
         if not table:
@@ -160,7 +295,14 @@ class TableEnforcer:
             allowed = {name for s, name in configured if s == schema}
             for table in sorted(existing - allowed):
                 try:
-                    self.client.drop_table(schema, table, cascade=True, missing_ok=True)
+                    self._apply_action(
+                        f"DROP TABLE {schema}.{table} CASCADE",
+                        self.client.drop_table,
+                        schema,
+                        table,
+                        cascade=True,
+                        missing_ok=True,
+                    )
                     logger.warning("Dropped table not in config: %s.%s", schema, table)
                 except Exception:
                     logger.exception("Failed to drop table %s.%s", schema, table)
@@ -186,7 +328,11 @@ class TableEnforcer:
         columns_cfg = t.get("columns", [])
         indexes_cfg = t.get("indexes", [])
 
-        self.client.ensure_schema(schema)
+        self._apply_action(
+            f"CREATE SCHEMA IF NOT EXISTS {schema}",
+            self.client.ensure_schema,
+            schema,
+        )
 
         if not self.client.table_exists(schema, table):
             self._create_table_from_config(schema, table, columns_cfg, indexes_cfg)
@@ -259,7 +405,15 @@ class TableEnforcer:
                 enum_sql = self._enum_values_sql(enum_vals)
                 constraints.append(f'CONSTRAINT "{con_name}" CHECK ("{c["name"]}" IN ({enum_sql}))')
 
-        self.client.create_table(schema, table, columns, constraints=constraints, if_not_exists=True)
+        self._apply_action(
+            f"CREATE TABLE {schema}.{table}",
+            self.client.create_table,
+            schema,
+            table,
+            columns,
+            constraints=constraints,
+            if_not_exists=True,
+        )
         self._ensure_indexes(schema, table, indexes_cfg, columns_cfg)
 
     def _alter_table_additive(
@@ -297,7 +451,14 @@ class TableEnforcer:
                     mod_bits.append("NOT NULL")
 
             col_def = (type_sql + (" " + " ".join(mod_bits) if mod_bits else "")).strip()
-            self.client.add_column(schema, table, name, col_def)
+            self._apply_action(
+                f"ALTER TABLE {schema}.{table} ADD COLUMN {name}",
+                self.client.add_column,
+                schema,
+                table,
+                name,
+                col_def,
+            )
             logger.info("Added column %s.%s.%s", schema, table, name)
             changes_detected = True
 
@@ -305,7 +466,13 @@ class TableEnforcer:
             if c.get("unique", False) and not c.get("primary_key", False):
                 con_name = f"{table}_{c['name']}_key"
                 if not self.client.constraint_exists(schema, table, con_name):
-                    self.client.add_constraint(schema, table, f'CONSTRAINT "{con_name}" UNIQUE ("{c["name"]}")')
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {con_name}",
+                        self.client.add_constraint,
+                        schema,
+                        table,
+                        f'CONSTRAINT "{con_name}" UNIQUE ("{c["name"]}")',
+                    )
                     logger.info("Added UNIQUE constraint %s on %s.%s(%s)", con_name, schema, table, c["name"])
                     changes_detected = True
 
@@ -323,7 +490,13 @@ class TableEnforcer:
                         frag += f" ON DELETE {on_delete.upper()}"
                     if on_update:
                         frag += f" ON UPDATE {on_update.upper()}"
-                    self.client.add_constraint(schema, table, frag)
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {con_name}",
+                        self.client.add_constraint,
+                        schema,
+                        table,
+                        frag,
+                    )
                     logger.info("Added FK constraint %s on %s.%s(%s)", con_name, schema, table, c["name"])
                     changes_detected = True
             enum_vals = c.get("enum")
@@ -331,7 +504,9 @@ class TableEnforcer:
                 con_name = f"{table}_{c['name']}_enum_check"
                 if not self.client.constraint_exists(schema, table, con_name):
                     enum_sql = self._enum_values_sql(enum_vals)
-                    self.client.add_constraint(
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {con_name}",
+                        self.client.add_constraint,
                         schema,
                         table,
                         f'CONSTRAINT "{con_name}" CHECK ("{c["name"]}" IN ({enum_sql}))',
@@ -363,7 +538,16 @@ class TableEnforcer:
             if c.get("index", False):
                 idx_name = f"{table}_{c['name']}_idx"
                 if idx_name not in existing:
-                    self.client.create_index(schema, table, idx_name, [c["name"]], unique=False, if_not_exists=True)
+                    self._apply_action(
+                        f"CREATE INDEX {idx_name} ON {schema}.{table}",
+                        self.client.create_index,
+                        schema,
+                        table,
+                        idx_name,
+                        [c["name"]],
+                        unique=False,
+                        if_not_exists=True,
+                    )
                     logger.info("Created index %s on %s.%s(%s)", idx_name, schema, table, c["name"])
                     changed = True
 
@@ -373,7 +557,16 @@ class TableEnforcer:
                 continue
             cols = idx["columns"]
             unique = bool(idx.get("unique", False))
-            self.client.create_index(schema, table, name, cols, unique=unique, if_not_exists=True)
+            self._apply_action(
+                f"CREATE {'UNIQUE ' if unique else ''}INDEX {name} ON {schema}.{table}",
+                self.client.create_index,
+                schema,
+                table,
+                name,
+                cols,
+                unique=unique,
+                if_not_exists=True,
+            )
             logger.info("Created index %s on %s.%s(%s)", name, schema, table, ", ".join(cols))
             changed = True
 
@@ -405,7 +598,14 @@ class TableEnforcer:
             if "default" in c and c["default"] is not None:
                 mod_bits.append(f"DEFAULT {self._default_sql(c['default'])}")
             col_def = (type_sql + (" " + " ".join(mod_bits) if mod_bits else "")).strip()
-            self.client.add_column(schema, table, name, col_def)
+            self._apply_action(
+                f"ALTER TABLE {schema}.{table} ADD COLUMN {name}",
+                self.client.add_column,
+                schema,
+                table,
+                name,
+                col_def,
+            )
             logger.info("Added column %s.%s.%s", schema, table, name)
             changed = True
 
@@ -418,7 +618,14 @@ class TableEnforcer:
             existing_sig = self._existing_type_signature(info)
             if expected_sig != existing_sig:
                 type_sql = self._column_type_sql(c)
-                self.client.alter_column_type(schema, table, name, type_sql)
+                self._apply_action(
+                    f"ALTER TABLE {schema}.{table} ALTER COLUMN {name} TYPE {type_sql}",
+                    self.client.alter_column_type,
+                    schema,
+                    table,
+                    name,
+                    type_sql,
+                )
                 logger.info("Altered type of %s.%s.%s to %s", schema, table, name, type_sql)
                 changed = True
 
@@ -427,7 +634,14 @@ class TableEnforcer:
             if nullable_expected != nullable_current:
                 if not nullable_expected and cleanup_not_null_rows:
                     self._cleanup_nulls(schema, table, name)
-                self.client.alter_column_nullability(schema, table, name, nullable=nullable_expected)
+                self._apply_action(
+                    f"ALTER TABLE {schema}.{table} ALTER COLUMN {name} {'DROP NOT NULL' if nullable_expected else 'SET NOT NULL'}",
+                    self.client.alter_column_nullability,
+                    schema,
+                    table,
+                    name,
+                    nullable=nullable_expected,
+                )
                 logger.info(
                     "Altered nullability of %s.%s.%s to %s",
                     schema,
@@ -443,12 +657,26 @@ class TableEnforcer:
                 expected_default = self._normalize_default(self._default_sql(c["default"]))
                 current_norm = self._normalize_default(current_default)
                 if expected_default != current_norm:
-                    self.client.alter_column_default(schema, table, name, default_sql=self._default_sql(c["default"]))
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} ALTER COLUMN {name} SET DEFAULT",
+                        self.client.alter_column_default,
+                        schema,
+                        table,
+                        name,
+                        default_sql=self._default_sql(c["default"]),
+                    )
                     logger.info("Altered default of %s.%s.%s", schema, table, name)
                     changed = True
             else:
                 if current_default is not None:
-                    self.client.alter_column_default(schema, table, name, drop=True)
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} ALTER COLUMN {name} DROP DEFAULT",
+                        self.client.alter_column_default,
+                        schema,
+                        table,
+                        name,
+                        drop=True,
+                    )
                     logger.info("Dropped default of %s.%s.%s", schema, table, name)
                     changed = True
 
@@ -456,7 +684,14 @@ class TableEnforcer:
             try:
                 if cleanup_not_null_rows:
                     self._cleanup_nulls(schema, table, name)
-                self.client.alter_column_nullability(schema, table, name, nullable=False)
+                self._apply_action(
+                    f"ALTER TABLE {schema}.{table} ALTER COLUMN {name} SET NOT NULL",
+                    self.client.alter_column_nullability,
+                    schema,
+                    table,
+                    name,
+                    nullable=False,
+                )
                 logger.info("Enforced NOT NULL on %s.%s.%s after cleanup", schema, table, name)
                 changed = True
             except Exception:
@@ -464,7 +699,15 @@ class TableEnforcer:
 
         extras = sorted(existing_colnames - config_cols)
         for col in extras:
-            self.client.drop_column(schema, table, col, cascade=True, missing_ok=True)
+            self._apply_action(
+                f"ALTER TABLE {schema}.{table} DROP COLUMN {col} CASCADE",
+                self.client.drop_column,
+                schema,
+                table,
+                col,
+                cascade=True,
+                missing_ok=True,
+            )
             logger.info("Dropped extra column %s.%s.%s", schema, table, col)
             changed = True
 
@@ -489,7 +732,14 @@ class TableEnforcer:
             if con_name.endswith("_not_null"):
                 continue
             if con_name not in expected_constraints:
-                self.client.drop_constraint(schema, table, con_name, missing_ok=True)
+                self._apply_action(
+                    f"ALTER TABLE {schema}.{table} DROP CONSTRAINT {con_name}",
+                    self.client.drop_constraint,
+                    schema,
+                    table,
+                    con_name,
+                    missing_ok=True,
+                )
                 logger.info("Dropped constraint %s on %s.%s", con_name, schema, table)
                 changed = True
 
@@ -497,15 +747,34 @@ class TableEnforcer:
             pk_name = f"{table}_pkey"
             if not self.client.constraint_exists(schema, table, pk_name):
                 col_list = ", ".join(f'"{c}"' for c in pk_columns)
-                self.client.add_constraint(schema, table, f'CONSTRAINT "{pk_name}" PRIMARY KEY ({col_list})')
+                self._apply_action(
+                    f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {pk_name}",
+                    self.client.add_constraint,
+                    schema,
+                    table,
+                    f'CONSTRAINT "{pk_name}" PRIMARY KEY ({col_list})',
+                )
                 logger.info("Added PRIMARY KEY %s on %s.%s(%s)", pk_name, schema, table, ", ".join(pk_columns))
                 changed = True
             else:
                 current_pk_cols = self.client.get_constraint_columns(schema, table, pk_name)
                 if set(current_pk_cols) != set(pk_columns):
-                    self.client.drop_constraint(schema, table, pk_name, missing_ok=True)
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} DROP CONSTRAINT {pk_name}",
+                        self.client.drop_constraint,
+                        schema,
+                        table,
+                        pk_name,
+                        missing_ok=True,
+                    )
                     col_list = ", ".join(f'"{c}"' for c in pk_columns)
-                    self.client.add_constraint(schema, table, f'CONSTRAINT "{pk_name}" PRIMARY KEY ({col_list})')
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {pk_name}",
+                        self.client.add_constraint,
+                        schema,
+                        table,
+                        f'CONSTRAINT "{pk_name}" PRIMARY KEY ({col_list})',
+                    )
                     logger.info("Rebuilt PRIMARY KEY %s on %s.%s(%s)", pk_name, schema, table, ", ".join(pk_columns))
                     changed = True
 
@@ -513,7 +782,13 @@ class TableEnforcer:
             if c.get("unique", False) and not c.get("primary_key", False):
                 con_name = f"{table}_{c['name']}_key"
                 if not self.client.constraint_exists(schema, table, con_name):
-                    self.client.add_constraint(schema, table, f'CONSTRAINT "{con_name}" UNIQUE ("{c["name"]}")')
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {con_name}",
+                        self.client.add_constraint,
+                        schema,
+                        table,
+                        f'CONSTRAINT "{con_name}" UNIQUE ("{c["name"]}")',
+                    )
                     logger.info("Added UNIQUE constraint %s on %s.%s(%s)", con_name, schema, table, c["name"])
                     changed = True
 
@@ -531,7 +806,13 @@ class TableEnforcer:
                         frag += f" ON DELETE {on_delete.upper()}"
                     if on_update:
                         frag += f" ON UPDATE {on_update.upper()}"
-                    self.client.add_constraint(schema, table, frag)
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {con_name}",
+                        self.client.add_constraint,
+                        schema,
+                        table,
+                        frag,
+                    )
                     logger.info("Added FK constraint %s on %s.%s(%s)", con_name, schema, table, c["name"])
                     changed = True
             enum_vals = c.get("enum")
@@ -539,7 +820,9 @@ class TableEnforcer:
                 con_name = f"{table}_{c['name']}_enum_check"
                 if not self.client.constraint_exists(schema, table, con_name):
                     enum_sql = self._enum_values_sql(enum_vals)
-                    self.client.add_constraint(
+                    self._apply_action(
+                        f"ALTER TABLE {schema}.{table} ADD CONSTRAINT {con_name}",
+                        self.client.add_constraint,
                         schema,
                         table,
                         f'CONSTRAINT "{con_name}" CHECK ("{c["name"]}" IN ({enum_sql}))',
@@ -560,7 +843,13 @@ class TableEnforcer:
         existing_indexes = {r["indexname"] for r in self.client.list_indexes(schema, table)}
         constraint_indexes = set(self.client.list_constraint_indexes(schema, table))
         for idx_name in sorted(existing_indexes - expected_indexes - constraint_indexes):
-            self.client.drop_index(schema, idx_name, missing_ok=True)
+            self._apply_action(
+                f"DROP INDEX {schema}.{idx_name}",
+                self.client.drop_index,
+                schema,
+                idx_name,
+                missing_ok=True,
+            )
             logger.info("Dropped index %s on %s.%s", idx_name, schema, table)
             changed = True
 
@@ -584,6 +873,9 @@ class TableEnforcer:
         return s.strip().lower()
 
     def _cleanup_nulls(self, schema: str, table: str, column: str) -> None:
+        if self._plan_only:
+            self._record_action(f'DELETE FROM {schema}.{table} WHERE "{column}" IS NULL')
+            return
         try:
             deleted = self.client.delete_rows_with_filters(
                 f"{schema}.{table}",
@@ -609,6 +901,10 @@ class TableEnforcer:
         return ", ".join(escaped)
 
     def _expected_type_signature(self, c: dict) -> tuple:
+        if "type" not in c or c["type"] is None:
+            if c.get("raw_type"):
+                return (str(c["raw_type"]).lower(),)
+            return ("",)
         t = str(c["type"]).lower()
         if t in {"varchar", "character varying"}:
             return ("varchar", int(c.get("length", 0)))
@@ -646,6 +942,11 @@ class TableEnforcer:
         return (data_type or "",)
 
     def _column_type_sql(self, c: dict) -> str:
+        if "type" not in c or c["type"] is None:
+            if c.get("raw_type"):
+                return str(c["raw_type"])
+            raise ValueError(f"Unsupported column type: {c.get('type')} (column {c.get('name')})")
+
         t = str(c["type"]).lower()
 
         if t in {"uuid", "text", "boolean", "timestamp", "timestamptz", "date", "json", "jsonb"}:
@@ -678,13 +979,13 @@ class TableEnforcer:
                 return f"numeric({int(prec)})"
             return "numeric"
 
-        if c.get("raw_type"):
-            return str(c["raw_type"])
-
         raise ValueError(f"Unsupported column type: {c['type']} (column {c.get('name')})")
 
 
-def enforce_tables(client: PSQLClient, **kwargs) -> set[tuple[str, str]]:
+def enforce_tables(
+    client: PSQLClient,
+    **kwargs,
+) -> set[tuple[str, str]] | tuple[set[tuple[str, str]], list[str]]:
     """
     Convenience wrapper:
 

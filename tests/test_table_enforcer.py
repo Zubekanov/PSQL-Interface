@@ -197,6 +197,49 @@ class TestTableEnforcer(unittest.TestCase):
         client.add_constraint.assert_called_with("public", "users", 'CONSTRAINT "users_pkey" PRIMARY KEY ("id")')
         client.drop_index.assert_called_once_with("public", "legacy_idx", missing_ok=True)
 
+    def test_enforce_plan_only_returns_actions_and_skips_mutations(self):
+        client = self._make_client()
+        enforcer = TableEnforcer(client)
+
+        out = enforcer.enforce(
+            config_payloads=[_basic_table_config("users")],
+            safe_mode=True,
+            plan_only=True,
+        )
+
+        configured, actions = out
+        self.assertEqual(configured, {("public", "users")})
+        self.assertTrue(any("CREATE SCHEMA IF NOT EXISTS public" in action for action in actions))
+        self.assertTrue(any("CREATE TABLE public.users" in action for action in actions))
+        client.ensure_schema.assert_not_called()
+        client.create_table.assert_not_called()
+
+    def test_validate_config_rejects_invalid_payloads(self):
+        client = self._make_client()
+        enforcer = TableEnforcer(client)
+
+        with self.assertRaisesRegex(ValueError, "non-empty 'columns'"):
+            enforcer.validate_config({"table_name": "users", "columns": []})
+
+        bad_index = {
+            "table_name": "users",
+            "columns": [{"name": "id", "type": "integer"}],
+            "indexes": [{"name": "users_bad_idx", "columns": ["missing_col"]}],
+        }
+        with self.assertRaisesRegex(ValueError, "unknown columns"):
+            enforcer.validate_config(bad_index)
+
+        with self.assertRaisesRegex(ValueError, "duplicate column"):
+            enforcer.validate_config(
+                {
+                    "table_name": "users",
+                    "columns": [
+                        {"name": "id", "type": "integer"},
+                        {"name": "id", "type": "integer"},
+                    ],
+                }
+            )
+
     def test_enforce_requires_source(self):
         client = self._make_client()
         enforcer = TableEnforcer(client)
@@ -225,6 +268,16 @@ class TestTableEnforcer(unittest.TestCase):
             enforcer._cleanup_nulls("public", "users", "email")
 
         self.assertTrue(any("Deleted 3 rows with NULL public.users.email" in msg for msg in logs.output))
+
+    def test_cleanup_nulls_plan_only_records_action(self):
+        client = self._make_client()
+        enforcer = TableEnforcer(client)
+        enforcer._plan_only = True
+
+        enforcer._cleanup_nulls("public", "users", "email")
+
+        self.assertEqual(enforcer.last_plan, ['DELETE FROM public.users WHERE "email" IS NULL'])
+        client.delete_rows_with_filters.assert_not_called()
 
 
 if __name__ == "__main__":
